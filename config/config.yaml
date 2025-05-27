@@ -1,0 +1,151 @@
+# Agent Ecosystem Configuration
+# Base configuration file - can be overridden by environment-specific configs
+
+# Environment settings
+environment: development
+debug: true
+
+# Database configuration
+database:
+  type: mongodb  # mongodb or postgresql
+  host: localhost
+  port: 27017
+  username: null
+  password: null
+  database: agent_ecosystem
+  
+  # Connection pool settings
+  min_connections: 5
+  max_connections: 20
+  connection_timeout: 30
+  
+  # MongoDB specific
+  replica_set: null
+  auth_source: admin
+  
+  # PostgreSQL specific
+  ssl_mode: prefer
+
+# Security configuration
+security:
+  jwt_secret_key: "your-secret-key-change-in-production-make-it-at-least-32-characters-long"
+  jwt_algorithm: HS256
+  jwt_expiration_hours: 24
+  jwt_refresh_expiration_days: 7
+  
+  # Rate limiting
+  rate_limit_requests: 100
+  rate_limit_window_seconds: 60
+  
+  # Password requirements
+  password_min_length: 8
+  password_require_special: true
+  password_require_numbers: true
+  password_require_uppercase: true
+  
+  # Session settings
+  session_timeout_minutes: 30
+  max_concurrent_sessions: 5
+  
+  # Security monitoring
+  max_failed_attempts: 5
+  lockout_duration_minutes: 15
+
+# Monitoring and observability
+monitoring:
+  enabled: true
+  metrics_port: 8000
+  health_check_interval: 30
+  
+  # Prometheus settings
+  prometheus_enabled: true
+  prometheus_namespace: agent_ecosystem
+  
+  # Logging settings
+  log_level: INFO
+  log_format: json  # json or text
+  log_file: null
+  log_rotation: true
+  log_max_size: 100MB
+  log_backup_count: 5
+  
+  # Telemetry settings
+  telemetry_enabled: false
+  jaeger_endpoint: null
+  
+  # Performance tracking
+  performance_tracking_enabled: true
+  performance_window_size: 100
+
+# Lobby server configuration
+lobby:
+  host: localhost
+  http_port: 8080
+  websocket_port: 8081
+  
+  # WebSocket settings
+  websocket_ping_interval: 30
+  websocket_ping_timeout: 10
+  websocket_close_timeout: 10
+  
+  # Message handling
+  message_queue_size: 1000
+  message_timeout: 30
+  max_message_size: 1048576  # 1MB
+  
+  # Agent management
+  agent_timeout: 300  # 5 minutes
+  max_agents: 1000
+  agent_heartbeat_interval: 60
+
+# Redis configuration (optional)
+redis:
+  enabled: false
+  host: localhost
+  port: 6379
+  password: null
+  database: 0
+  
+  # Connection pool settings
+  max_connections: 20
+  connection_timeout: 5
+  
+  # Cache settings
+  default_ttl: 3600  # 1 hour
+  key_prefix: "agent_ecosystem:"
+
+# API configuration
+api:
+  enabled: true
+  host: localhost
+  port: 8000
+  
+  # CORS settings
+  cors_enabled: true
+  cors_origins: ["*"]
+  cors_methods: ["GET", "POST", "PUT", "DELETE"]
+  cors_headers: ["*"]
+  
+  # Request limits
+  max_request_size: 10485760  # 10MB
+  request_timeout: 30
+  
+  # Documentation
+  docs_enabled: true
+  docs_url: "/docs"
+  redoc_url: "/redoc"
+
+# Feature flags
+features:
+  database_persistence: true
+  security_enabled: true
+  monitoring_enabled: true
+  redis_caching: false
+  api_enabled: true
+  websocket_compression: false
+  message_encryption: false
+
+# Custom settings (for application-specific configuration)
+custom:
+  example_setting: "example_value"
+  another_setting: 42 

@@ -1,0 +1,40 @@
+aiohttp>=3.8.4
+asyncio>=3.4.3
+python-dotenv>=0.20.0
+jsonschema>=4.0.0
+websockets>=11.0.0
+
+# Database dependencies
+motor>=3.3.0  # Async MongoDB driver
+asyncpg>=0.29.0  # Async PostgreSQL driver
+sqlalchemy>=2.0.0  # ORM for PostgreSQL
+alembic>=1.12.0  # Database migrations
+
+# Monitoring and observability
+prometheus-client>=0.17.0
+structlog>=23.1.0
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+opentelemetry-instrumentation-aiohttp>=0.41b0
+
+# Security and authentication
+cryptography>=41.0.0
+pyjwt>=2.8.0
+bcrypt>=4.0.0
+
+# Performance and caching
+redis>=5.0.0
+aioredis>=2.0.0
+
+# Additional utilities
+pydantic>=2.0.0
+click>=8.1.0  # For CLI tools
+rich>=13.0.0  # For beautiful console output
+tenacity>=8.2.0  # For retry logic
+
+# Configuration management
+pyyaml>=6.0.0
+watchdog>=3.0.0  # For file watching
+
+# System monitoring
+psutil>=5.9.0  # For system metrics 

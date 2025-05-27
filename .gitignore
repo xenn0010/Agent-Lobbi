@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables
+.env
+
+# Log files
+*.log
+simulation_run.log
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE / Editor specific
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Alembic specific (often not needed in repo if env.py is configured correctly)
+# alembic.ini # Usually committed, but if it contains sensitive DB URLs, it might be gitignored
+
+# Other
+.DS_Store
+*.swp 
