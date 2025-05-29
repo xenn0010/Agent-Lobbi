@@ -1,21 +1,22 @@
-aiohttp>=3.8.4
+aiohttp==3.8.5
 asyncio>=3.4.3
 python-dotenv>=0.20.0
 jsonschema>=4.0.0
-websockets>=11.0.0
+websockets==11.0.3
 
 # Database dependencies
 motor>=3.3.0  # Async MongoDB driver
-asyncpg>=0.29.0  # Async PostgreSQL driver
-sqlalchemy>=2.0.0  # ORM for PostgreSQL
-alembic>=1.12.0  # Database migrations
+asyncpg==0.28.4  # Async PostgreSQL driver
+sqlalchemy[asyncio]==2.0.19  # ORM for PostgreSQL
+alembic==1.11.1  # Database migrations
+databases[postgresql]==0.7.0
 
 # Monitoring and observability
-prometheus-client>=0.17.0
-structlog>=23.1.0
+prometheus-client==0.17.1
+structlog==23.1.0
 opentelemetry-api>=1.20.0
 opentelemetry-sdk>=1.20.0
-opentelemetry-instrumentation-aiohttp>=0.41b0
+opentelemetry-instrumentation-aiohttp-client>=0.41b0
 
 # Security and authentication
 cryptography>=41.0.0
@@ -24,17 +25,38 @@ bcrypt>=4.0.0
 
 # Performance and caching
 redis>=5.0.0
-aioredis>=2.0.0
+aioredis==2.0.1
 
 # Additional utilities
-pydantic>=2.0.0
+pydantic==2.1.1
 click>=8.1.0  # For CLI tools
 rich>=13.0.0  # For beautiful console output
-tenacity>=8.2.0  # For retry logic
+tenacity==8.2.2  # For retry logic
 
 # Configuration management
 pyyaml>=6.0.0
 watchdog>=3.0.0  # For file watching
 
 # System monitoring
-psutil>=5.9.0  # For system metrics 
+psutil==5.9.5  # For system metrics
+
+# Error Recovery & Resilience
+circuit-breaker==1.0.1
+
+# Load Balancing & Health
+consul-python==1.1.0
+
+# Testing & Development
+pytest==7.4.0
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+black==23.7.0
+mypy==1.5.1
+
+# New dependencies
+aiofiles==23.1.0
+python-multipart==0.0.6
+uvloop==0.17.0
+
+# New database dependencies
+aiosqlite==0.19.0 

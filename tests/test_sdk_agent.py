@@ -13,8 +13,8 @@ sys.path.insert(0, sdk_path)
 from sdk.ecosystem_sdk import EcosystemClient, Message, MessageType, AgentCapabilitySDK
 
 # Configuration for the mock lobby
-MOCK_LOBBY_HTTP_URL = "http://localhost:8080"
-MOCK_LOBBY_WS_URL = "ws://localhost:8081"
+MOCK_LOBBY_HTTP_URL = "http://localhost:8092"
+MOCK_LOBBY_WS_URL = "ws://localhost:8091"
 TEST_API_KEY = "test_api_key"
 TEST_AGENT_ID = "sdk_tester_001"
 TEST_AGENT_TYPE = "TestAgent"
@@ -122,8 +122,8 @@ async def run_sdk_test():
 if __name__ == "__main__":
     # Ensure the mock server is running before starting the client test
     print("---------------------------------------------------------------------")
-    print("MAKE SURE mock_lobby_server.py IS RUNNING ON localhost:8080 (HTTP) and localhost:8081 (WS)")
-    print("Run: python tests/mock_lobby_server.py")
+    print("MAKE SURE simple_mock_lobby.py IS RUNNING ON localhost:8092 (HTTP) and localhost:8091 (WS)")
+    print("Run: python tests/simple_mock_lobby.py")
     print("---------------------------------------------------------------------")
     input("Press Enter to start the test agent once the mock server is running...")
     

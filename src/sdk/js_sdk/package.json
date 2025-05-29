@@ -1,0 +1,34 @@
+{
+  "name": "@agent-lobby/sdk",
+  "version": "0.1.0",
+  "description": "JavaScript SDK for interacting with the Agent Lobby ecosystem.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified yet\" && exit 1",
+    "example": "node ../enhanced_ecosystem_sdk.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/agent_lobby.git"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "ecosystem",
+    "lobby",
+    "sdk"
+  ],
+  "author": "AI Assistant <assistant@example.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/yourusername/agent_lobby/issues"
+  },
+  "homepage": "https://github.com/yourusername/agent_lobby#readme",
+  "dependencies": {
+    "ws": "^8.14.2",
+    "uuid": "^9.0.1",
+    "node-fetch": "^2.6.7",
+    "yaml": "^2.3.0"
+  },
+  "type": "commonjs"
+} 

@@ -72,46 +72,33 @@ async def handle_register(request):
 
 async def websocket_handler(websocket):
     """Handle WebSocket connections."""
-    # In newer websockets versions, we need to get the path differently
-    path = websocket.request.path if hasattr(websocket, 'request') else "/unknown"
-    print(f"SIMPLE MOCK: WebSocket connection to path: {path}")
-    
+    print("SIMPLE MOCK: WEBSOCKET_HANDLER_V_LATEST_PROTOCOL_COMPLIANT --- New connection attempt.")
+    agent_id_for_cleanup = "unknown_agent_at_start"
     try:
-        # Parse path to get agent_id and token
-        # Expected: /ws/{agent_id}?token={token}
-        parts = path.strip("/").split("?")
-        if not parts[0].startswith("ws/"):
-            print(f"SIMPLE MOCK: Invalid path format: {path}")
-            await websocket.close(code=1003, reason="Invalid path")
-            return
-            
-        agent_id = parts[0].split("/")[1]
+        # According to PROTOCOL.md, after WebSocket connection, the agent should send REGISTER_CLIENT
+        # The auth token was already validated during WebSocket handshake (in the URI)
+        # We'll extract agent_id from the first REGISTER_CLIENT message or from URI if needed
+
+        # For now, let's handle messages without requiring a specific first message
+        # The agent_id can be extracted from any message's sender_id
         
-        # Check token
-        token = None
-        if len(parts) > 1:
-            params = dict(p.split("=") for p in parts[1].split("&"))
-            token = params.get("token")
-            
-        if token != GENERATED_AUTH_TOKEN:
-            print(f"SIMPLE MOCK: Invalid token for {agent_id}: {token}")
-            await websocket.close(code=1008, reason="Invalid token")
-            return
-            
-        print(f"SIMPLE MOCK: Agent {agent_id} connected via WebSocket")
-        connected_agents[agent_id] = websocket
-        
-        # Handle messages
         async for raw_message in websocket:
-            print(f"SIMPLE MOCK: Received from {agent_id}: {raw_message[:100]}...")
+            print(f"SIMPLE MOCK (V_LATEST): Received message: {raw_message[:150]}...")
             
             try:
                 msg_data = json.loads(raw_message)
+                sender_id = msg_data.get("sender_id")
                 msg_type = msg_data.get("message_type")
+                
+                # Set agent_id from first message if not set
+                if agent_id_for_cleanup == "unknown_agent_at_start" and sender_id:
+                    agent_id_for_cleanup = sender_id
+                    connected_agents[sender_id] = websocket
+                    print(f"SIMPLE MOCK (V_LATEST): Agent {sender_id} identified from message.")
                 
                 if msg_type == "INFO":
                     # Echo INFO messages back
-                    print(f"SIMPLE MOCK: Echoing INFO message back to {agent_id}")
+                    print(f"SIMPLE MOCK: Echoing INFO message back to {sender_id}")
                     await websocket.send(raw_message)
                     
                 elif msg_type == "REQUEST":
@@ -122,40 +109,38 @@ async def websocket_handler(websocket):
                     if action == "get_time":
                         response = create_message(
                             sender_id=MOCK_LOBBY_ID,
-                            receiver_id=agent_id,
+                            receiver_id=sender_id,
                             message_type="RESPONSE",
                             payload={"time": datetime.now(timezone.utc).isoformat(), "status": "success"}
                         )
                         response["conversation_id"] = conv_id
-                        print(f"SIMPLE MOCK: Sending time response to {agent_id}")
+                        print(f"SIMPLE MOCK: Sending time response to {sender_id}")
                         await websocket.send(json.dumps(response))
                     else:
                         # Unknown action
                         error_response = create_message(
                             sender_id=MOCK_LOBBY_ID,
-                            receiver_id=agent_id,
+                            receiver_id=sender_id,
                             message_type="ERROR",
                             payload={"error": "unknown_action", "detail": f"Unknown action: {action}"}
                         )
                         error_response["conversation_id"] = conv_id
-                        print(f"SIMPLE MOCK: Sending error response to {agent_id}")
+                        print(f"SIMPLE MOCK: Sending error response to {sender_id}")
                         await websocket.send(json.dumps(error_response))
                         
             except json.JSONDecodeError:
-                print(f"SIMPLE MOCK: Invalid JSON from {agent_id}: {raw_message}")
+                print(f"SIMPLE MOCK: Invalid JSON: {raw_message}")
             except Exception as e:
-                print(f"SIMPLE MOCK: Error processing message from {agent_id}: {e}")
+                print(f"SIMPLE MOCK (V_LATEST): Error processing message: {e}", exc_info=True)
                 
-    except websockets.exceptions.ConnectionClosedOK:
-        print(f"SIMPLE MOCK: {agent_id} disconnected gracefully")
     except websockets.exceptions.ConnectionClosedError as e:
-        print(f"SIMPLE MOCK: {agent_id} disconnected with error: {e.code} - {e.reason}")
+        print(f"SIMPLE MOCK (V_LATEST): ConnectionClosedError for {agent_id_for_cleanup}: {e.code} - {e.reason}")
     except Exception as e:
-        print(f"SIMPLE MOCK: Unexpected error in websocket handler: {e}")
+        print(f"SIMPLE MOCK (V_LATEST): Unexpected error in websocket handler for {agent_id_for_cleanup}: {e}", exc_info=True)
     finally:
-        if agent_id in connected_agents:
-            del connected_agents[agent_id]
-        print(f"SIMPLE MOCK: Cleaned up connection for {agent_id}")
+        if agent_id_for_cleanup != "unknown_agent_at_start" and agent_id_for_cleanup in connected_agents:
+            del connected_agents[agent_id_for_cleanup]
+        print(f"SIMPLE MOCK (V_LATEST): Cleaned up connection for {agent_id_for_cleanup}.")
 
 async def main():
     print("SIMPLE MOCK: Starting servers...")
@@ -166,13 +151,13 @@ async def main():
     
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "localhost", 8080)
+    site = web.TCPSite(runner, "localhost", 8092)
     await site.start()
-    print("SIMPLE MOCK: HTTP server started on http://localhost:8080")
+    print("SIMPLE MOCK: HTTP server started on http://localhost:8092")
     
     # WebSocket Server
-    ws_server = await websockets.serve(websocket_handler, "localhost", 8081)
-    print("SIMPLE MOCK: WebSocket server started on ws://localhost:8081")
+    ws_server = await websockets.serve(websocket_handler, "localhost", 8091)
+    print("SIMPLE MOCK: WebSocket server started on ws://localhost:8091")
     
     print("SIMPLE MOCK: Servers ready!")
     

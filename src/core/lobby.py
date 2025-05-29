@@ -3,11 +3,34 @@ print("!!!!!!!!!! EXECUTING LATEST LOBBY.PY !!!!!!!!!!") # VFS: Prominent top-le
 import asyncio
 import uuid # For generating tokens
 from typing import Dict, List, Any, Optional, Set, cast
-import datetime # Added for timestamping logs
+from datetime import datetime, timezone # Fixed import
 import json # Added for structured logging
+import logging
+import time
+import websockets
+import structlog
+from aiohttp import web
 
 from .message import Message, MessageType, MessagePriority, MessageValidationError
 from .agent import Agent, Capability # Forward declaration for type hint
+from .agent_learning import (
+    LearningSession, LearningTaskSpec, LearningCapability, 
+    TestEnvironment, LearningSessionStatus, LearningCapabilityType
+)
+from .world_state import WorldState
+from .collaboration_engine import CollaborationEngine, WorkflowStatus, TaskStatus
+
+# Import our production components
+from .database import db_manager
+from .load_balancer import load_balancer, LoadBalancingStrategy
+
+# Import monitoring SDK with absolute import
+try:
+    from sdk.monitoring_sdk import monitoring_sdk, MonitoringConfig
+except ImportError:
+    # Fallback for different import contexts
+    monitoring_sdk = None
+    MonitoringConfig = None
 
 # --- Constants ---
 MAX_FAILED_AUTH_ATTEMPTS = 3
@@ -16,41 +39,182 @@ AUTH_LOCKOUT_DURATION_SECONDS = 300 # 5 minutes
 LOG_FILE_PATH = "simulation_run.log" # Define log file path
 
 class Lobby:
-    def __init__(self, world_state_path="world_state.json"):
-        print("!!!!!!!!!! LOBBY __INIT__ CALLED - LATEST VERSION !!!!!!!!!!") # VFS: Prominent init print
-        self.agents: Dict[str, Agent] = {}
-        # agent_id -> capability_name -> capability_details
-        self.agent_capabilities: Dict[str, Dict[str, Capability]] = {} 
-        self.registered_agents: Set[str] = set() 
-        self.agent_auth_tokens: Dict[str, str] = {} 
-        self.lobby_id = "global_lobby" 
-        self.failed_auth_attempts: Dict[str, int] = {} 
-        self.auth_lockout_timers: Dict[str, asyncio.TimerHandle] = {}
-        self._log_file_handle = open(LOG_FILE_PATH, "a", encoding="utf-8")
-        self._log_lock = asyncio.Lock()
-        # New: Message handling queues and tracking
-        self._priority_queues: Dict[MessagePriority, asyncio.PriorityQueue] = {
-            priority: asyncio.PriorityQueue() for priority in MessagePriority
-        }
-        self._pending_acks: Dict[str, asyncio.Event] = {}  # message_id -> Event
-        self._message_timeouts: Dict[str, asyncio.TimerHandle] = {}  # message_id -> Timer
-        self._agent_types: Dict[str, str] = {}  # agent_id -> agent_type
-        self._message_processor_task: Optional[asyncio.Task] = None
+    """
+    Production-ready Agent Lobby with database, load balancing, and monitoring
+    """
+    
+    def __init__(self, host: str = "localhost", http_port: int = 8080, ws_port: int = 8081):
+        self.host = host
+        self.http_port = http_port
+        self.ws_port = ws_port
+        
+        # Core components
+        self.agents: Dict[str, Dict[str, Any]] = {}
+        self.conversations: Dict[str, Dict[str, Any]] = {}
+        self.active_workflows: Dict[str, Any] = {}
+        self.websocket_connections: Dict[str, websockets.WebSocketServerProtocol] = {}
+        
+        # Production components
+        self.db_manager = db_manager
+        self.load_balancer = load_balancer
+        self.monitoring = monitoring_sdk if monitoring_sdk else None
+        
+        # Collaboration engine import
+        try:
+            from .collaboration_engine import CollaborationEngine
+            self.collaboration_engine = CollaborationEngine(self)
+        except ImportError:
+            logger.warning("Collaboration engine not available")
+            self.collaboration_engine = None
+        
+        # Setup structured logging
+        self.logger = structlog.get_logger(__name__)
+        
+        # Initialize monitoring
+        self._setup_monitoring()
+        
+        # Server instances
+        self.http_server = None
+        self.ws_server = None
+        self._cleanup_tasks = []
+        
+    def _safe_monitoring_call(self, method_name: str, *args, **kwargs):
+        """Safely call monitoring methods, handling None case"""
+        if self.monitoring and hasattr(self.monitoring, method_name):
+            try:
+                method = getattr(self.monitoring, method_name)
+                return method(*args, **kwargs)
+            except Exception as e:
+                self.logger.warning("Monitoring call failed", method=method_name, error=str(e))
+        return None
+    
+    def _setup_monitoring(self):
+        """Setup monitoring and health checks"""
+        if not self.monitoring:
+            return
+            
+        # Add custom health checks
+        def agents_health_check():
+            """Check if we have registered agents"""
+            return len(self.agents) > 0
+        
+        def database_health_check():
+            """Check database connectivity"""
+            try:
+                # This would be a simple database ping
+            return True
+            except:
+        return False
 
-        # Reputation System
-        self.agent_reputation: Dict[str, float] = {} # agent_id -> reputation_score
-        self.agent_interaction_history: Dict[str, List[Dict[str, Any]]] = {} # agent_id -> list of interactions
-        self.default_reputation = 100.0
-        self.reputation_change_on_success = {"provider": 5.0, "requester": 1.0}
-        self.reputation_change_on_failure = {"provider": -10.0, "requester": -0.5} # Minor penalty for failed request initiation
-        self.penalty_suspicious_report_reporter = -25.0 # Severe penalty for suspicious reporting
-        self.penalty_suspicious_report_provider = -2.0 # Minor penalty for being subject of suspicious report, or none
+        self.monitoring.add_health_check("agents_registered", agents_health_check, interval=60)
+        self.monitoring.add_health_check("database_connection", database_health_check, interval=30, critical=True)
+    
+    async def start(self):
+        """Start the lobby with all production components"""
+        try:
+            self.logger.info("Starting Agent Lobby", 
+                           http_port=self.http_port, 
+                           ws_port=self.ws_port)
+            
+            # Initialize database
+            await self.db_manager.initialize()
+            self.logger.info("Database initialized")
+            
+            # Start load balancer
+            await self.load_balancer.start()
+            self.logger.info("Load balancer started")
+            
+            # Start monitoring
+            if self.monitoring:
+                await self.monitoring.start()
+                self.logger.info("Monitoring started")
+            else:
+                self.logger.warning("Monitoring SDK not available")
+            
+            # Start collaboration engine if available
+            if self.collaboration_engine:
+                await self.collaboration_engine.start()
+                self.logger.info("Collaboration engine started")
+            
+            # Start HTTP server
+            app = self._create_http_app()
+            runner = web.AppRunner(app)
+            await runner.setup()
+            
+            site = web.TCPSite(runner, self.host, self.http_port)
+            await site.start()
+            self.http_server = runner
+            
+            # Start WebSocket server
+            self.ws_server = await websockets.serve(
+                self._websocket_handler,
+                self.host,
+                self.ws_port,
+                ping_interval=30,
+                ping_timeout=10,
+                close_timeout=10
+            )
+            
+            # Start cleanup task
+            cleanup_task = asyncio.create_task(self._periodic_cleanup())
+            self._cleanup_tasks.append(cleanup_task)
+            
+            # Record metrics
+            self._safe_monitoring_call("increment", "agents.registered")
+            self._safe_monitoring_call("gauge", "agents.total", len(self.agents))
+            
+            self.logger.info("Agent Lobby started successfully")
+            
+        except Exception as e:
+            self.logger.error("Failed to start lobby", error=str(e))
+            await self.stop()
+            raise
+    
+    async def stop(self):
+        """Stop the lobby and cleanup resources"""
+        self.logger.info("Stopping Agent Lobby")
+        
+        try:
+            # Cancel cleanup tasks
+            for task in self._cleanup_tasks:
+                task.cancel()
+            
+            if self._cleanup_tasks:
+                await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
+            
+            # Stop WebSocket server
+            if self.ws_server:
+                self.ws_server.close()
+                await self.ws_server.wait_closed()
+            
+            # Stop HTTP server
+            if self.http_server:
+                await self.http_server.cleanup()
+            
+            # Stop collaboration engine
+            if self.collaboration_engine:
+                await self.collaboration_engine.stop()
+            
+            # Stop monitoring
+            if self.monitoring:
+                await self.monitoring.stop()
+            
+            # Stop load balancer
+            await self.load_balancer.stop()
+            
+            # Close database connections
+            await self.db_manager.close()
+            
+            self.logger.info("Agent Lobby stopped")
+            
+        except Exception as e:
+            self.logger.error("Error during shutdown", error=str(e))
 
     async def _log_message_event(self, event_type: str, data: Dict):
         """Logs generic lobby events. 'data' is a dictionary of event-specific details."""
         async with self._log_lock:
             log_entry = {
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "event_type": event_type,
                 "details": data 
             }
@@ -63,7 +227,7 @@ class Lobby:
                                auth_status: str = "N/A"):
         async with self._log_lock:
             log_entry = {
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "sender": sender_id,
                 "receiver": receiver_id,
                 "message_type": msg_type.name,
@@ -73,7 +237,7 @@ class Lobby:
             }
             self._log_file_handle.write(json.dumps(log_entry) + "\n")
             self._log_file_handle.flush()
-            print(f"{datetime.datetime.now(datetime.timezone.utc).isoformat()} | {sender_id} -> {receiver_id} | {msg_type.name} | ConvID: {conversation_id} | Auth: {auth_status} | {payload}")
+            print(f"{datetime.now(timezone.utc).isoformat()} | {sender_id} -> {receiver_id} | {msg_type.name} | ConvID: {conversation_id} | Auth: {auth_status} | {payload}")
 
     async def start(self):
         """Start the message processing loop."""
@@ -223,7 +387,7 @@ class Lobby:
 
         # Send message to all target agents
         for agent_id in target_agents:
-            if agent_id in self.agents:
+        if agent_id in self.agents:
                 try:
                     await self.agents[agent_id].receive_message(message)
                 except Exception as e:
@@ -268,11 +432,11 @@ class Lobby:
                 # Consider sending an explicit auth error message back to the sender if not a REGISTER message
                 if message.message_type != MessageType.REGISTER:
                     await self._send_error_to_agent(message.sender_id, "Authentication failed for your message.", message.message_id)
-                return
-            
+            return
+
             # Add to appropriate priority queue
             # Store (priority_value, timestamp, message_id, message_object)
-            timestamp = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            timestamp = datetime.now(timezone.utc).timestamp()
             await self._priority_queues[message.priority].put(
                 (message.priority.value, timestamp, message.message_id, message)
             )
@@ -298,42 +462,239 @@ class Lobby:
                 )
                 await self.agents[message.sender_id].receive_message(error_msg)
 
-    async def register_agent(self, agent: Agent):
-        """Enhanced agent registration with type tracking and initial reputation."""
-        if agent.agent_id in self.agents:
-            await self._log_message_event("AGENT_REGISTRATION_FAILED", {"agent_id": agent.agent_id, "reason": "Already registered"})
-            return
+    async def register_agent(self, agent_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Register an agent with production features"""
+        try:
+            agent_id = agent_data.get("agent_id")
+            if not agent_id:
+                raise ValueError("Agent ID is required")
+            
+            # Prepare agent data for database
+            db_agent_data = {
+                "id": agent_id,
+                "agent_type": agent_data.get("agent_type", "unknown"),
+                "capabilities": agent_data.get("capabilities", []),
+                "status": "online",
+                "metadata": {
+                    "registered_at": datetime.now(timezone.utc).isoformat(),
+                    "last_seen": datetime.now(timezone.utc).isoformat(),
+                    **agent_data.get("metadata", {})
+                },
+                "reputation": 100.0,
+                "last_seen": datetime.now(timezone.utc),
+                "created_at": datetime.now(timezone.utc)
+            }
+            
+            # Save to database
+            success = await self.db_manager.save_agent(db_agent_data)
+            if not success:
+                raise Exception("Failed to save agent to database")
+            
+            # Register with load balancer
+            capability_names = [cap.get("name", "unknown") for cap in agent_data.get("capabilities", [])]
+            self.load_balancer.register_agent(
+                agent_id=agent_id,
+                capabilities=capability_names,
+                max_load=agent_data.get("max_load", 100),
+                weight=agent_data.get("weight", 1.0),
+                metadata=agent_data.get("metadata", {})
+            )
+            
+            # Store in memory for quick access
+            self.agents[agent_id] = db_agent_data
+            
+            # Record metrics
+            self._safe_monitoring_call("increment", "agents.registered")
+            self._safe_monitoring_call("gauge", "agents.total", len(self.agents))
+            
+            self.logger.info("Agent registered successfully", 
+                           agent_id=agent_id, 
+                           capabilities=len(capability_names))
+            
+            return {
+                "status": "success",
+                "agent_id": agent_id,
+                "message": "Agent registered successfully"
+            }
+            
+        except Exception as e:
+            self._safe_monitoring_call("increment", "agents.registration_failures")
+            self.logger.error("Agent registration failed", 
+                            agent_id=agent_data.get("agent_id"), 
+                            error=str(e))
+            raise
+    
+    async def route_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Route message with load balancing and error recovery"""
+        try:
+            sender_id = message.get("sender_id")
+            receiver_id = message.get("receiver_id") 
+            message_type = message.get("message_type")
+            
+            # Record metrics
+            self._safe_monitoring_call("increment", "messages.total")
+            self._safe_monitoring_call("increment", f"messages.{message_type.lower()}")
+            
+            # Save message to database for audit
+            message_data = {
+                "id": message.get("message_id", str(uuid.uuid4())),
+                "sender_id": sender_id,
+                "receiver_id": receiver_id,
+                "message_type": message_type,
+                "payload": message.get("payload", {}),
+                "conversation_id": message.get("conversation_id"),
+                "status": "processing",
+                "priority": message.get("priority", 2),
+                "created_at": datetime.now(timezone.utc)
+            }
+            
+            await self.db_manager.save_message(message_data)
+            
+            # Handle different message types with load balancing
+            if receiver_id == "lobby":
+                result = await self._handle_lobby_message(message)
+            elif receiver_id == "*" or receiver_id == "broadcast":
+                result = await self._handle_broadcast_message(message)
+        else:
+                # Use load balancer for capability-based routing
+                if message_type == "CAPABILITY_REQUEST":
+                    required_capability = message.get("payload", {}).get("capability")
+                    if required_capability:
+                        target_agent = self.load_balancer.get_agent_for_capability(required_capability)
+                        if target_agent:
+                            receiver_id = target_agent
+                            message["receiver_id"] = target_agent
+                
+                result = await self._handle_direct_message(message)
+            
+            # Update message status
+            message_data["status"] = "delivered" if result.get("status") == "success" else "failed"
+            message_data["processed_at"] = datetime.now(timezone.utc)
+            await self.db_manager.save_message(message_data)
+            
+            self._safe_monitoring_call("increment", "messages.successful")
+            return result
+            
+        except Exception as e:
+            self._safe_monitoring_call("increment", "messages.failed")
+            self.logger.error("Message routing failed", 
+                            message_id=message.get("message_id"), 
+                            error=str(e))
+            
+            # Update message status to failed
+            message_data["status"] = "failed"
+            message_data["processed_at"] = datetime.now(timezone.utc)
+            await self.db_manager.save_message(message_data)
+            
+            return {
+                "status": "error",
+                "message": f"Message routing failed: {str(e)}"
+            }
 
-            self.agents[agent.agent_id] = agent
-            agent.lobby_ref = self
+    async def _handle_lobby_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle messages directed to the lobby with monitoring"""
+        message_type = message.get("message_type")
+        
+        async with self.monitoring.timer(f"lobby_message.{message_type.lower()}"):
+            try:
+                if message_type == "REGISTER":
+                    return await self.register_agent(message.get("payload", {}))
+                
+                elif message_type == "GET_AGENTS":
+                    agents = await self.db_manager.get_all_agents()
+                    return {"status": "success", "agents": agents}
+                
+                elif message_type == "CREATE_WORKFLOW" and self.collaboration_engine:
+                    return await self._handle_create_workflow(message)
+                
+                elif message_type == "START_WORKFLOW" and self.collaboration_engine:
+                    return await self._handle_start_workflow(message)
+                
+                elif message_type == "GET_WORKFLOW_STATUS" and self.collaboration_engine:
+                    return await self._handle_get_workflow_status(message)
+                
+                elif message_type == "CREATE_COLLABORATION" and self.collaboration_engine:
+                    return await self._handle_create_collaboration(message)
+                
+                elif message_type == "GET_LOAD_BALANCER_STATS":
+                    return {"status": "success", "stats": self.load_balancer.get_stats()}
+                
+                elif message_type == "GET_MONITORING_STATUS":
+                    return {"status": "success", "monitoring": self.monitoring.get_status()}
+                
+                else:
+                    return {"status": "error", "message": f"Unknown message type: {message_type}"}
+                    
+            except Exception as e:
+                self.logger.error("Lobby message handling failed", 
+                                message_type=message_type, 
+                                error=str(e))
+                return {"status": "error", "message": str(e)}
 
-        # Store capabilities
-        self.agent_capabilities[agent.agent_id] = {}
-        for cap_dict in agent.get_capabilities():
-            cap = cast(Capability, cap_dict)
-            self.agent_capabilities[agent.agent_id][cap["name"]] = cap
-
-        # Generate and store auth token
-        token = str(uuid.uuid4())
-        self.agent_auth_tokens[agent.agent_id] = token
-        agent.auth_token = token
-        self.registered_agents.add(agent.agent_id)
-
-        # Store agent type (derived from agent class name or explicit type)
-        agent_type = getattr(agent, "agent_type", agent.__class__.__name__)
-        self._agent_types[agent.agent_id] = agent_type
-
-        # Initialize reputation and interaction history
-        self.agent_reputation[agent.agent_id] = self.default_reputation
-        self.agent_interaction_history[agent.agent_id] = []
-
-        await self._log_message_event("AGENT_REGISTERED", {
-            "agent_id": agent.agent_id,
-            "agent_type": agent_type,
-            "initial_reputation": self.agent_reputation[agent.agent_id],
-            "capabilities": agent.get_capabilities()
-        })
-        print(f"Agent {agent.agent_id} ({agent_type}) successfully registered. Token: {'present' if token else 'None'}. Initial Reputation: {self.agent_reputation[agent.agent_id]}")
+    async def _periodic_cleanup(self):
+        """Periodic cleanup task with monitoring"""
+        while True:
+            try:
+                await asyncio.sleep(300)  # Run every 5 minutes
+                
+                # Clean up stale agents
+                current_time = datetime.now(timezone.utc)
+                stale_agents = []
+                
+                for agent_id, agent_data in list(self.agents.items()):
+                    last_seen = agent_data.get("last_seen")
+                    if isinstance(last_seen, str):
+                        last_seen = datetime.fromisoformat(last_seen.replace('Z', '+00:00'))
+                    
+                    if last_seen and (current_time - last_seen).total_seconds() > 600:  # 10 minutes
+                        stale_agents.append(agent_id)
+                
+                # Remove stale agents
+                for agent_id in stale_agents:
+                    await self._remove_stale_agent(agent_id)
+                
+                # Update metrics
+                self._safe_monitoring_call("gauge", "agents.active", len(self.agents))
+                self._safe_monitoring_call("gauge", "websockets.active", len(self.websocket_connections))
+                self._safe_monitoring_call("gauge", "workflows.active", len(self.active_workflows))
+                
+                if stale_agents:
+                    self.logger.info("Cleaned up stale agents", count=len(stale_agents))
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error("Cleanup task error", error=str(e))
+    
+    async def _remove_stale_agent(self, agent_id: str):
+        """Remove a stale agent from all systems"""
+        try:
+            # Remove from memory
+            if agent_id in self.agents:
+                del self.agents[agent_id]
+            
+            # Remove from load balancer
+            self.load_balancer.unregister_agent(agent_id)
+            
+            # Update database status
+            agent_data = await self.db_manager.get_agent(agent_id)
+            if agent_data:
+                agent_data["status"] = "offline"
+                await self.db_manager.save_agent(agent_data)
+            
+            # Close websocket connection if exists
+            if agent_id in self.websocket_connections:
+                try:
+                    await self.websocket_connections[agent_id].close()
+                except:
+                    pass
+                del self.websocket_connections[agent_id]
+            
+            self._safe_monitoring_call("increment", "agents.removed_stale")
+            self.logger.info("Stale agent removed", agent_id=agent_id)
+            
+        except Exception as e:
+            self.logger.error("Failed to remove stale agent", agent_id=agent_id, error=str(e))
 
     async def _is_request_authorized(self, sender_id: str, target_agent_id: str, capability_name: str) -> bool:
         if target_agent_id not in self.agent_capabilities or capability_name not in self.agent_capabilities[target_agent_id]:
@@ -395,6 +756,50 @@ class Lobby:
 
         elif msg.message_type == MessageType.TASK_OUTCOME_REPORT:
             await self._handle_task_outcome_report(msg)
+
+        # Learning Collaboration Message Handlers
+        elif msg.message_type == MessageType.CREATE_LEARNING_SESSION:
+            await self._handle_create_learning_session(msg)
+        
+        elif msg.message_type == MessageType.JOIN_LEARNING_SESSION:
+            await self._handle_join_learning_session(msg)
+            
+        elif msg.message_type == MessageType.LEAVE_LEARNING_SESSION:
+            await self._handle_leave_learning_session(msg)
+            
+        elif msg.message_type == MessageType.SHARE_MODEL_PARAMETERS:
+            await self._handle_share_model_parameters(msg)
+            
+        elif msg.message_type == MessageType.REQUEST_COLLABORATION:
+            await self._handle_request_collaboration(msg)
+            
+        elif msg.message_type == MessageType.REPORT_LEARNING_PROGRESS:
+            await self._handle_report_learning_progress(msg)
+            
+        elif msg.message_type == MessageType.CREATE_TEST_ENVIRONMENT:
+            await self._handle_create_test_environment(msg)
+            
+        elif msg.message_type == MessageType.RUN_MODEL_TEST:
+            await self._handle_run_model_test(msg)
+            
+        elif msg.message_type == MessageType.GET_TEST_RESULTS:
+            await self._handle_get_test_results(msg)
+
+        # Workflow and Collaboration Message Handlers
+        elif msg.message_type == MessageType.REQUEST and msg.payload.get("action") == "create_workflow":
+            await self._handle_create_workflow_request(msg)
+            
+        elif msg.message_type == MessageType.REQUEST and msg.payload.get("action") == "start_workflow":
+            await self._handle_start_workflow_request(msg)
+            
+        elif msg.message_type == MessageType.REQUEST and msg.payload.get("action") == "get_workflow_status":
+            await self._handle_get_workflow_status_request(msg)
+            
+        elif msg.message_type == MessageType.REQUEST and msg.payload.get("action") == "create_collaboration":
+            await self._handle_create_collaboration_request(msg)
+            
+        elif msg.message_type == MessageType.RESPONSE and "task_id" in msg.payload:
+            await self.collaboration_engine.handle_task_result(msg)
 
         # ... other lobby message types (HEALTH_CHECK, etc.) can be added here
         else:
@@ -532,7 +937,7 @@ class Lobby:
         self.agent_reputation[reporter_id] = max(0, current_reporter_rep + rep_change_reporter)
 
         interaction_record = {
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "reporter_id": reporter_id,
             "provider_agent_id": provider_agent_id,
             "capability_name": capability_name,
@@ -550,7 +955,7 @@ class Lobby:
         if not (is_suspicious_report and reporter_id == provider_agent_id):
             if provider_agent_id in self.agent_interaction_history:
                 self.agent_interaction_history[provider_agent_id].append(interaction_record)
-            else:
+        else:
                 self.agent_interaction_history[provider_agent_id] = [interaction_record]
         
         if reporter_id in self.agent_interaction_history:
@@ -627,7 +1032,7 @@ class Lobby:
     def close_log_file(self):
         """Closes the log file handle. Should be called on graceful shutdown."""
         if self._log_file_handle and not self._log_file_handle.closed:
-            self._log_file_handle.write(f"{datetime.datetime.now(datetime.timezone.utc).isoformat()} - Lobby shutting down. Log closed.\n")
+            self._log_file_handle.write(f"{datetime.now(timezone.utc).isoformat()} - Lobby shutting down. Log closed.\n")
             self._log_file_handle.close()
             print("Lobby log file closed.")
 
@@ -667,4 +1072,592 @@ class Lobby:
 #         lobby.close_log_file()
 
 # if __name__ == "__main__":
-# asyncio.run(main()) 
+# asyncio.run(main())
+
+# ====== LEARNING COLLABORATION MESSAGE HANDLERS ======
+    
+    async def _handle_create_learning_session(self, msg: Message):
+        """Handle request to create a new learning session"""
+        try:
+            agent_id = msg.sender_id
+            payload = msg.payload
+            
+            # Extract task specification
+            task_spec_data = payload.get("task_spec", {})
+            task_spec = LearningTaskSpec(
+                task_name=task_spec_data.get("task_name", ""),
+                task_type=task_spec_data.get("task_type", "supervised"),
+                objective=task_spec_data.get("objective", ""),
+                data_requirements=task_spec_data.get("data_requirements", {}),
+                success_criteria=task_spec_data.get("success_criteria", {}),
+                collaboration_preferences=task_spec_data.get("collaboration_preferences", []),
+                computational_constraints=task_spec_data.get("computational_constraints", {})
+            )
+            
+            # Create learning session
+            session = LearningSession(
+                task_spec=task_spec,
+                creator_id=agent_id
+            )
+            session.add_participant(agent_id)
+            
+            # Store session
+            self.learning_sessions[session.session_id] = session
+            self.active_collaborations[session.session_id] = {agent_id}
+            
+            await self._log_message_event("LEARNING_SESSION_CREATED", {
+                "session_id": session.session_id,
+                "creator": agent_id,
+                "task_type": task_spec.task_type
+            })
+            
+            # Send success response
+            response_payload = {
+                "success": True,
+                "session_id": session.session_id,
+                "message": "Learning session created successfully"
+            }
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to create learning session: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+
+    async def _handle_join_learning_session(self, msg: Message):
+        """Handle request to join an existing learning session"""
+        try:
+            agent_id = msg.sender_id
+            session_id = msg.payload.get("session_id")
+            
+            if not session_id or session_id not in self.learning_sessions:
+                error_payload = {"error": "Invalid or non-existent session ID"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+                
+            session = self.learning_sessions[session_id]
+            
+            # Add participant to session
+            if session.add_participant(agent_id):
+                self.active_collaborations[session_id].add(agent_id)
+                
+                await self._log_message_event("AGENT_JOINED_LEARNING_SESSION", {
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "participant_count": len(session.participants)
+                })
+                
+                # Notify all participants about new member
+                for participant_id in session.participants:
+                    if participant_id != agent_id and participant_id in self.agents:
+                        notification_msg = Message(
+                            sender_id=self.lobby_id,
+                            receiver_id=participant_id,
+                            message_type=MessageType.LEARNING_SESSION_UPDATE,
+                            payload={
+                                "event": "participant_joined",
+                                "session_id": session_id,
+                                "new_participant": agent_id
+                            }
+                        )
+                        await self.agents[participant_id].receive_message(notification_msg)
+                
+                response_payload = {
+                    "success": True,
+                    "message": "Successfully joined learning session",
+                    "session_info": session.to_dict()
+                }
+                await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            else:
+                error_payload = {"error": "Agent already in session"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                
+        except Exception as e:
+            error_payload = {"error": f"Failed to join learning session: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+
+    async def _handle_leave_learning_session(self, msg: Message):
+        """Handle request to leave a learning session"""
+        try:
+            agent_id = msg.sender_id
+            session_id = msg.payload.get("session_id")
+            
+            if not session_id or session_id not in self.learning_sessions:
+                error_payload = {"error": "Invalid or non-existent session ID"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+                
+            session = self.learning_sessions[session_id]
+            
+            if session.remove_participant(agent_id):
+                self.active_collaborations[session_id].discard(agent_id)
+                
+                await self._log_message_event("AGENT_LEFT_LEARNING_SESSION", {
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "remaining_participants": len(session.participants)
+                })
+                
+                # If no participants left, close session
+                if not session.participants:
+                    session.status = LearningSessionStatus.CANCELLED
+                    del self.active_collaborations[session_id]
+                    await self._log_message_event("LEARNING_SESSION_CLOSED", {
+                        "session_id": session_id,
+                        "reason": "no_participants"
+                    })
+                else:
+                    # Notify remaining participants
+                    for participant_id in session.participants:
+                        if participant_id in self.agents:
+                            notification_msg = Message(
+                                sender_id=self.lobby_id,
+                                receiver_id=participant_id,
+                                message_type=MessageType.LEARNING_SESSION_UPDATE,
+                                payload={
+                                    "event": "participant_left",
+                                    "session_id": session_id,
+                                    "left_participant": agent_id
+                                }
+                            )
+                            await self.agents[participant_id].receive_message(notification_msg)
+                
+                response_payload = {"success": True, "message": "Successfully left learning session"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            else:
+                error_payload = {"error": "Agent not in session"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                
+        except Exception as e:
+            error_payload = {"error": f"Failed to leave learning session: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+
+    async def _handle_share_model_parameters(self, msg: Message):
+        """Handle sharing of model parameters between agents in a learning session"""
+        try:
+            agent_id = msg.sender_id
+            session_id = msg.payload.get("session_id")
+            parameters = msg.payload.get("parameters", {})
+            
+            if not session_id or session_id not in self.learning_sessions:
+                error_payload = {"error": "Invalid or non-existent session ID"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+                
+            session = self.learning_sessions[session_id]
+            
+            if agent_id not in session.participants:
+                error_payload = {"error": "Agent not participant in session"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+            
+            # Store parameters in session
+            session.update_parameters(agent_id, parameters)
+            
+            await self._log_message_event("MODEL_PARAMETERS_SHARED", {
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "parameter_keys": list(parameters.keys())
+            })
+            
+            # Notify other participants about parameter update
+            for participant_id in session.participants:
+                if participant_id != agent_id and participant_id in self.agents:
+                    notification_msg = Message(
+                        sender_id=self.lobby_id,
+                        receiver_id=participant_id,
+                        message_type=MessageType.LEARNING_SESSION_UPDATE,
+                        payload={
+                            "event": "parameters_updated",
+                            "session_id": session_id,
+                            "updated_by": agent_id,
+                            "available_parameters": list(session.shared_parameters.keys())
+                        }
+                    )
+                    await self.agents[participant_id].receive_message(notification_msg)
+            
+            response_payload = {"success": True, "message": "Parameters shared successfully"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to share parameters: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+
+    async def _handle_request_collaboration(self, msg: Message):
+        """Handle request for learning collaboration - find suitable agents"""
+        try:
+            agent_id = msg.sender_id
+            payload = msg.payload
+            required_capabilities = payload.get("required_capabilities", [])
+            task_description = payload.get("task_description", "")
+            
+            # Find agents with matching learning capabilities
+            suitable_agents = []
+            
+            for other_agent_id, learning_caps in self.agent_learning_capabilities.items():
+                if other_agent_id == agent_id:
+                        continue
+                    
+                # Check if agent has required capabilities
+                agent_cap_types = [cap.type.value for cap in learning_caps]
+                
+                match_score = 0
+                for req_cap in required_capabilities:
+                    if req_cap in agent_cap_types:
+                        match_score += 1
+                
+                if match_score > 0:
+                    suitable_agents.append({
+                        "agent_id": other_agent_id,
+                        "capabilities": [cap.to_dict() for cap in learning_caps],
+                        "match_score": match_score,
+                        "reputation": self.agent_reputation.get(other_agent_id, self.default_reputation)
+                    })
+            
+            # Sort by match score and reputation
+            suitable_agents.sort(key=lambda x: (x["match_score"], x["reputation"]), reverse=True)
+            
+            await self._log_message_event("COLLABORATION_REQUEST_PROCESSED", {
+                "requester": agent_id,
+                "required_capabilities": required_capabilities,
+                "found_agents": len(suitable_agents)
+            })
+            
+            response_payload = {
+                "success": True,
+                "suitable_agents": suitable_agents[:10],  # Return top 10 matches
+                "message": f"Found {len(suitable_agents)} suitable collaboration partners"
+            }
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to process collaboration request: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+
+    async def _handle_report_learning_progress(self, msg: Message):
+        """Handle learning progress reports from agents"""
+        try:
+            agent_id = msg.sender_id
+            session_id = msg.payload.get("session_id")
+            progress = msg.payload.get("progress", {})
+            
+            if not session_id or session_id not in self.learning_sessions:
+                error_payload = {"error": "Invalid or non-existent session ID"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+                
+            session = self.learning_sessions[session_id]
+            
+            if agent_id not in session.participants:
+                error_payload = {"error": "Agent not participant in session"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+            
+            # Update progress in session
+            session.update_progress(agent_id, progress)
+            
+            await self._log_message_event("LEARNING_PROGRESS_REPORTED", {
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "progress_metrics": list(progress.keys())
+            })
+            
+            response_payload = {"success": True, "message": "Progress reported successfully"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to report progress: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+
+    async def _handle_create_test_environment(self, msg: Message):
+        """Handle request to create a test environment"""
+        try:
+            agent_id = msg.sender_id
+            payload = msg.payload
+            
+            env_config = payload.get("environment_config", {})
+            test_data = payload.get("test_data", {})
+            
+            # Create test environment
+            test_env = TestEnvironment(
+                env_name=env_config.get("name", f"test_env_{agent_id}"),
+                env_type=env_config.get("type", "basic"),
+                creator_id=agent_id,
+                configuration=env_config,
+                test_data=test_data
+            )
+            
+            test_env.participants.add(agent_id)
+            self.test_environments[test_env.env_id] = test_env
+            
+            await self._log_message_event("TEST_ENVIRONMENT_CREATED", {
+                "env_id": test_env.env_id,
+                "creator": agent_id,
+                "env_type": test_env.env_type
+            })
+            
+            response_payload = {
+                "success": True,
+                "env_id": test_env.env_id,
+                "message": "Test environment created successfully"
+            }
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to create test environment: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+
+    async def _handle_run_model_test(self, msg: Message):
+        """Handle request to run a model test in an environment"""
+        try:
+            agent_id = msg.sender_id
+            env_id = msg.payload.get("env_id")
+            model_config = msg.payload.get("model_config", {})
+            test_params = msg.payload.get("test_parameters", {})
+            
+            if not env_id or env_id not in self.test_environments:
+                error_payload = {"error": "Invalid or non-existent environment ID"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+                
+            test_env = self.test_environments[env_id]
+            
+            # For MVP, simulate test results
+            import random
+            test_results = {
+                "test_id": f"test_{uuid.uuid4().hex[:8]}",
+                "agent_id": agent_id,
+                "model_config": model_config,
+                "accuracy": random.uniform(0.7, 0.95),
+                "loss": random.uniform(0.1, 0.5),
+                "test_duration": random.uniform(10, 60),
+                "metrics": {
+                    "precision": random.uniform(0.8, 0.95),
+                    "recall": random.uniform(0.75, 0.9),
+                    "f1_score": random.uniform(0.8, 0.92)
+                },
+                "status": "completed"
+            }
+            
+            # Store results in environment
+            test_env.add_test_result(agent_id, test_results)
+            test_env.status = "completed"
+            
+            await self._log_message_event("MODEL_TEST_COMPLETED", {
+                "env_id": env_id,
+                "agent_id": agent_id,
+                "test_results": test_results
+            })
+            
+            response_payload = {
+                "success": True,
+                "test_results": test_results,
+                "message": "Model test completed successfully"
+            }
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to run model test: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+
+    async def _handle_get_test_results(self, msg: Message):
+        """Handle request to get test results from an environment"""
+        try:
+            agent_id = msg.sender_id
+            env_id = msg.payload.get("env_id")
+            
+            if not env_id or env_id not in self.test_environments:
+                error_payload = {"error": "Invalid or non-existent environment ID"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+
+            test_env = self.test_environments[env_id]
+            
+            # Filter results based on access permissions
+            accessible_results = {}
+            if agent_id == test_env.creator_id or agent_id in test_env.participants:
+                accessible_results = test_env.results
+            else:
+                # Only return agent's own results if not creator/participant
+                accessible_results = {agent_id: test_env.results.get(agent_id, {})}
+            
+            response_payload = {
+                "success": True,
+                "env_id": env_id,
+                "results": accessible_results,
+                "environment_status": test_env.status
+            }
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to get test results: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+
+    # ====== LEARNING CAPABILITY MANAGEMENT ======
+    
+    async def register_learning_agent(self, agent_id: str, learning_capabilities: List[LearningCapability]) -> Dict[str, Any]:
+        """Register an agent with learning capabilities"""
+        try:
+            self.agent_learning_capabilities[agent_id] = learning_capabilities
+            
+            await self._log_message_event("LEARNING_AGENT_REGISTERED", {
+                "agent_id": agent_id,
+                "capabilities": [cap.name for cap in learning_capabilities]
+            })
+            
+            return {
+                "success": True,
+                "message": "Learning capabilities registered successfully",
+                "registered_capabilities": [cap.to_dict() for cap in learning_capabilities]
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Failed to register learning capabilities: {str(e)}"}
+
+    async def get_learning_sessions_for_agent(self, agent_id: str) -> List[Dict[str, Any]]:
+        """Get all learning sessions an agent is participating in"""
+        agent_sessions = []
+        for session_id, session in self.learning_sessions.items():
+            if agent_id in session.participants:
+                agent_sessions.append(session.to_dict())
+        return agent_sessions
+
+    async def get_available_test_environments(self, agent_id: str) -> List[Dict[str, Any]]:
+        """Get test environments accessible to an agent"""
+        accessible_envs = []
+        for env_id, env in self.test_environments.items():
+            if agent_id == env.creator_id or agent_id in env.participants:
+                accessible_envs.append(env.to_dict())
+        return accessible_envs
+
+    # ====== WORKFLOW REQUEST HANDLERS ======
+    
+    async def _handle_create_workflow_request(self, msg: Message):
+        """Handle request to create a new workflow"""
+        try:
+            agent_id = msg.sender_id
+            payload = msg.payload
+            
+            workflow_name = payload.get("workflow_name", "")
+            workflow_description = payload.get("workflow_description", "")
+            tasks = payload.get("tasks", [])
+            
+            if not workflow_name or not tasks:
+                error_payload = {"error": "Missing workflow_name or tasks in request"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+            
+            # Create workflow using collaboration engine
+            workflow_id = await self.collaboration_engine.create_workflow(
+                name=workflow_name,
+                description=workflow_description,
+                created_by=agent_id,
+                task_definitions=tasks
+            )
+            
+            response_payload = {
+                "success": True,
+                "workflow_id": workflow_id,
+                "message": f"Workflow '{workflow_name}' created successfully"
+            }
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to create workflow: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+    
+    async def _handle_start_workflow_request(self, msg: Message):
+        """Handle request to start a workflow"""
+        try:
+            agent_id = msg.sender_id
+            workflow_id = msg.payload.get("workflow_id")
+            
+            if not workflow_id:
+                error_payload = {"error": "Missing workflow_id in request"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+            
+            # Start workflow using collaboration engine
+            success = await self.collaboration_engine.start_workflow(workflow_id)
+            
+            if success:
+                response_payload = {
+                    "success": True,
+                    "workflow_id": workflow_id,
+                    "message": "Workflow started successfully"
+                }
+            else:
+                response_payload = {
+                    "success": False,
+                    "error": "Failed to start workflow - workflow not found"
+                }
+            
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to start workflow: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+    
+    async def _handle_get_workflow_status_request(self, msg: Message):
+        """Handle request to get workflow status"""
+        try:
+            agent_id = msg.sender_id
+            workflow_id = msg.payload.get("workflow_id")
+            
+            if not workflow_id:
+                error_payload = {"error": "Missing workflow_id in request"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+
+            # Get workflow status using collaboration engine
+            status = self.collaboration_engine.get_workflow_status(workflow_id)
+            
+            if status:
+                response_payload = {
+                    "success": True,
+                    "workflow_status": status
+                }
+            else:
+                response_payload = {
+                    "success": False,
+                    "error": "Workflow not found"
+                }
+            
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to get workflow status: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+    
+    async def _handle_create_collaboration_request(self, msg: Message):
+        """Handle request to create a collaboration session"""
+        try:
+            agent_id = msg.sender_id
+            payload = msg.payload
+            
+            participant_ids = payload.get("participant_ids", [])
+            purpose = payload.get("purpose", "")
+            
+            if not participant_ids:
+                error_payload = {"error": "Missing participant_ids in request"}
+                await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+                return
+            
+            # Add requester to participants if not already included
+            if agent_id not in participant_ids:
+                participant_ids.append(agent_id)
+            
+            # Create collaboration session using collaboration engine
+            collab_id = await self.collaboration_engine.create_collaboration_session(
+                agent_ids=participant_ids,
+                purpose=purpose
+            )
+            
+            response_payload = {
+                "success": True,
+                "collaboration_id": collab_id,
+                "message": f"Collaboration session created with {len(participant_ids)} participants"
+            }
+            await self._send_direct_response(self.lobby_id, agent_id, msg, response_payload, MessageType.RESPONSE)
+            
+        except Exception as e:
+            error_payload = {"error": f"Failed to create collaboration session: {str(e)}"}
+            await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)

@@ -1,255 +1,386 @@
-# Agent Lobby Protocol v0.1.0
+# Agent Lobby Protocol v0.2.0
 
-## 1. Introduction
+## 1. Overview
 
-The Agent Lobby Protocol facilitates communication, service discovery, and collaboration between autonomous AI agents within a shared ecosystem. It is designed to be extensible and robust, enabling agents with diverse capabilities to interact securely and efficiently. The Lobby serves as a central message router, service registry, and enforcer of communication rules.
+The Agent Lobby Protocol (ALP) defines the communication standards for agents within the Agent Lobby ecosystem. It enables agents to register, discover each other, exchange messages, invoke capabilities, and interact securely and reliably. The Lobby acts as a central router, service registry, and authority.
 
-## 2. Core Concepts
+This document details the transport mechanisms, message structures, message types, communication flows, and security considerations.
 
-*   **Lobby:** The central intermediary. All inter-agent messages (except initial registration handshake) pass through the Lobby. It manages agent registration, service discovery, and enforces authentication and authorization rules. The default ID for the Lobby is `"global_lobby"`.
-*   **Agent:** An independent, addressable entity capable of sending and receiving messages, and providing or consuming services (capabilities). Each agent has a unique `agent_id`.
-*   **Capability:** A well-defined service or function an agent can perform. Capabilities are advertised during registration and include metadata such as input/output schemas and authorization rules.
-*   **Message:** The fundamental unit of communication, structured as a JSON-like object.
+## 2. Guiding Principles
 
-## 3. Message Structure (General)
+*   **Interoperability:** Allow agents developed in different languages to communicate seamlessly.
+*   **Extensibility:** Enable the protocol to evolve with new features and message types.
+*   **Clarity:** Provide unambiguous definitions for message structures and interaction patterns.
+*   **Security:** Ensure secure communication and authentication.
+*   **Reliability:** Offer mechanisms for message tracking and error handling.
 
-All messages adhere to the following base structure:
+## 3. Glossary
+
+*   **Agent:** An autonomous software entity capable of performing tasks, offering services (capabilities), and communicating via this protocol.
+*   **Lobby:** The central server infrastructure that facilitates agent communication, registration, and discovery.
+*   **Capability:** A well-defined service or function an agent can perform and advertise.
+*   **Message:** A JSON-formatted unit of data exchanged between agents or between an agent and the Lobby.
+*   **Transport:** The underlying communication channels (HTTP/S for registration, WebSocket (WSS) for real-time messaging).
+*   **`agent_id`:** A unique identifier for an agent (e.g., UUID).
+*   **`lobby_id`:** The unique identifier for the Lobby instance an agent is connected to (e.g., "global_lobby_main_prod").
+*   **`message_id`:** A unique UUID for each message, used for tracking and idempotency.
+*   **`conversation_id`:** A UUID used to group related messages in a multi-step interaction or request/response pattern.
+
+## 4. Transport Layer
+
+ALP utilizes two primary transport mechanisms:
+
+### 4.1. HTTP/S (for Initial Registration & Authentication)
+
+*   **Purpose:** Used by agents to perform an initial registration with the Lobby, submit credentials (like an API key), and receive an authentication token (`auth_token`).
+*   **Endpoint:** The Lobby exposes a secure HTTPS endpoint (e.g., `https://lobby.example.com/api/v1/register`).
+*   **Security:** Communication MUST occur over HTTPS (TLS).
+
+### 4.2. WebSocket (WSS) (for Real-time Communication)
+
+*   **Purpose:** Used for all subsequent real-time messaging between agents and the Lobby after successful registration and authentication.
+*   **Endpoint:** The Lobby exposes a secure WebSocket endpoint (e.g., `wss://lobby.example.com/ws/connect`).
+*   **Connection URI Format:** `wss://<lobby_host>:<lobby_port>/ws/connect?token=<auth_token>&agent_id=<agent_id>`
+    *   `auth_token`: The token received during the HTTP registration phase.
+    *   `agent_id`: The registered ID of the agent.
+*   **Security:** Communication MUST occur over WSS (TLS).
+*   **Subprotocols:** No specific WebSocket subprotocols are mandated by default, but implementations may negotiate them if needed for specific extensions.
+
+## 5. Message Structure (Core)
+
+All messages exchanged over WebSocket, regardless of type, MUST adhere to the following base JSON structure:
 
 ```json
 {
-  "sender_id": "string (agent_id of the sender)",
-  "receiver_id": "string (agent_id of the receiver, or 'global_lobby')",
-  "message_type": "string (MessageType enum value)",
-  "payload": "object (varies by message_type, can be empty: {})",
-  "conversation_id": "string (UUID, optional, for correlating messages in an exchange)",
-  "auth_token": "string (agent's authentication token, optional for REGISTER)"
+  "message_id": "string (UUIDv4, unique for each message)",
+  "protocol_version": "string (e.g., '0.2.0')",
+  "sender_id": "string (agent_id of the sender, or lobby_id if from Lobby)",
+  "receiver_id": "string (agent_id of the receiver, lobby_id, or special target like 'BROADCAST_ALL')",
+  "message_type": "string (Defines the purpose and payload structure, see Section 7)",
+  "payload": "object (Varies by message_type, can be empty: {})",
+  "timestamp": "string (ISO 8601 UTC format, e.g., '2023-10-27T10:30:00Z')",
+  "conversation_id": "string (UUIDv4, optional, for correlating messages)",
+  "auth_token": "string (Deprecated for WebSocket messages; authentication is handled by token in WebSocket connection URI. May be used for specific Lobby HTTP API calls beyond initial registration if any.)",
+  "metadata": "object (Optional, for custom headers or context, e.g., {'priority': 1, 'trace_id': 'xyz'})"
 }
 ```
 
-## 4. Message Types & Payloads
+**Field Explanations:**
 
-### 4.1. `REGISTER`
-*   **Direction:** Agent -> Lobby (`global_lobby`)
-*   **Purpose:** An agent sends this message to the Lobby to announce its presence and advertise its capabilities. This is part of the initial handshake; the agent does not yet have an `auth_token`.
+*   `message_id`: Generated by the sender. Crucial for idempotency and tracing.
+*   `protocol_version`: Version of the ALP this message conforms to.
+*   `sender_id`: Identifies the origin of the message.
+*   `receiver_id`: Identifies the intended recipient.
+    *   For agent-to-agent messages, this is the target `agent_id`.
+    *   For messages to the lobby, this is the `lobby_id`.
+    *   Special target IDs like `BROADCAST_ALL` can be used by the Lobby.
+*   `message_type`: A string enum value indicating the nature of the message. Determines the expected structure of the `payload`.
+*   `payload`: A JSON object containing data specific to the `message_type`.
+*   `timestamp`: UTC timestamp marking when the message was created by the sender.
+*   `conversation_id`: Used to link a sequence of messages, such as a request and its multiple responses, or an ongoing dialogue.
+*   `auth_token`: Primarily for initial HTTP registration. For WebSocket messages, authentication is established at the connection level using the token in the URI.
+*   `metadata`: An optional field for additional, non-core information.
+
+## 6. Connection Lifecycle (WebSocket)
+
+1.  **Agent Obtains `auth_token`:**
+    *   Agent performs an initial HTTP/S POST request to the Lobby's registration endpoint (e.g., `/api/v1/register`) including its static API Key and desired `agent_id` and `agent_type`.
+    *   Lobby validates the API Key, registers the agent (if `agent_id` is available or provisions one), and returns an `auth_token` and the `lobby_id`. (This is an alternative to the previous `lobby.register_agent()` followed by `REGISTER` message flow for a more typical client-server auth setup).
+2.  **WebSocket Connection:**
+    *   Agent initiates a WSS connection to the Lobby's WebSocket endpoint, providing the `auth_token` and its `agent_id` as query parameters in the URI.
+    *   Example: `wss://lobby.example.com/ws/connect?token=xxxxxxx&agent_id=yyyyyyy`
+3.  **Lobby Validates Connection:**
+    *   Lobby validates the `auth_token` and `agent_id`.
+    *   If valid, the WebSocket connection is established. The Lobby internally maps the WebSocket connection to the authenticated `agent_id`.
+    *   If invalid, the Lobby rejects the WebSocket connection (e.g., HTTP 401/403 equivalent status code during handshake).
+4.  **Post-Connection Registration (Optional but Recommended):**
+    *   Once WebSocket is connected, the agent SHOULD send a `REGISTER_CLIENT` message to confirm its presence and provide its capabilities. This ensures the Lobby has the most up-to-date capability list for this active session.
+    *   Lobby responds with `REGISTER_CLIENT_ACK`.
+5.  **Message Exchange:** Agents and Lobby exchange messages conforming to the structures in this protocol.
+6.  **Keep-Alive:**
+    *   The Lobby and agents SHOULD use WebSocket PING/PONG frames to maintain connection liveness and detect unresponsive peers.
+    *   The Lobby may define an inactivity timeout, after which it will send a PING. If no PONG is received, the connection may be closed.
+    *   Agents should also send PINGs if no data is sent for a period and expect PONGs.
+7.  **Graceful Shutdown (Agent Initiated):**
+    *   Agent sends an `UNREGISTER_CLIENT` message.
+    *   Agent closes the WebSocket connection.
+8.  **Disconnection:**
+    *   Can be initiated by agent, Lobby, or due to network issues.
+    *   SDKs SHOULD implement automatic reconnection strategies, including re-establishing the WebSocket connection (using the existing `auth_token` if still valid) and re-sending `REGISTER_CLIENT`. If `auth_token` is rejected, the agent must re-perform the full HTTP registration.
+    *   The Lobby updates the agent's status (e.g., to "offline") upon disconnection.
+
+## 7. Standard Message Types & Payloads
+
+### 7.1. Agent Registration and Session Management
+
+#### 7.1.1. `REGISTER_CLIENT`
+*   **Direction:** Agent -> Lobby
+*   **Purpose:** Sent by an agent immediately after a successful WebSocket connection to announce its capabilities for this session.
 *   **Payload:**
     ```json
     {
-      "capabilities": [
-        // Array of Capability objects (see Section 7)
+      "capabilities": [ /* Array of Capability objects (see Section 9) */ ],
+      "agent_version": "string (e.g., '1.2.3', version of the agent software)",
+      "sdk_version": "string (e.g., 'python-0.1.0', version of the SDK used)"
+    }
+    ```
+
+#### 7.1.2. `REGISTER_CLIENT_ACK`
+*   **Direction:** Lobby -> Agent
+*   **Purpose:** Lobby acknowledges the agent's `REGISTER_CLIENT` message.
+*   **Payload:**
+    ```json
+    {
+      "status": "string ('success' or 'failure')",
+      "lobby_id": "string (ID of the lobby instance)",
+      "message": "string (Optional, details or error message)",
+      "server_time_utc": "string (ISO 8601 UTC, Lobby's current time)",
+      "session_id": "string (UUID, unique ID for this specific WebSocket session)"
+    }
+    ```
+
+#### 7.1.3. `UNREGISTER_CLIENT`
+*   **Direction:** Agent -> Lobby
+*   **Purpose:** Agent informs the Lobby it is gracefully disconnecting.
+*   **Payload:**
+    ```json
+    {
+      "reason": "string (Optional, e.g., 'shutting_down', 'maintenance')"
+    }
+    ```
+    *(Lobby does not necessarily send an ACK for this; closing the WebSocket is the confirmation.)*
+
+### 7.2. Service Discovery
+
+#### 7.2.1. `DISCOVER_CAPABILITIES`
+*   **Direction:** Agent -> Lobby
+*   **Purpose:** Agent queries the Lobby for agents offering specific capabilities.
+*   **Payload:**
+    ```json
+    {
+      "capability_filter": { // Filter criteria
+        "name": "string (Optional, exact capability name, e.g., 'com.example.ImageAnalysis')",
+        "version_match": "string (Optional, e.g., '1.x', '>=2.0.0', semantic versioning preferred)",
+        "keywords": ["string"] // Optional, list of keywords
+      },
+      "max_results": "integer (Optional, default 10)"
+    }
+    ```
+
+#### 7.2.2. `CAPABILITIES_FOUND`
+*   **Direction:** Lobby -> Agent
+*   **Purpose:** Lobby responds with a list of agents and their matching capabilities.
+*   **Payload:**
+    ```json
+    {
+      "query_ref": "string (mirrors conversation_id from DISCOVER_CAPABILITIES if provided)",
+      "agents": [
+        {
+          "agent_id": "string",
+          "agent_type": "string",
+          "matching_capabilities": [ /* Array of full Capability objects (see Section 9) */ ],
+          "last_seen_utc": "string (ISO 8601 UTC, if available)"
+        }
       ]
     }
     ```
 
-### 4.2. `REGISTER_ACK`
-*   **Direction:** Lobby -> Agent
-*   **Purpose:** The Lobby sends this to an agent to confirm successful registration and provide an `auth_token`.
-*   **Payload:**
-    ```json
-    {
-      "status": "success_registered_finalized",
-      "lobby_id": "string (ID of the lobby, e.g., 'global_lobby')",
-      "auth_token": "string (the newly issued authentication token for the agent)"
-    }
-    ```
-    *   If registration fails (e.g., agent_id already taken, though current implementation pre-registers via `lobby.register_agent()` before this message is sent), an `ERROR` message might be sent or the connection handled differently by the Lobby.
+### 7.3. Agent-to-Agent Communication
 
-### 4.3. `DISCOVER_SERVICES`
-*   **Direction:** Agent -> Lobby (`global_lobby`)
-*   **Purpose:** An agent queries the Lobby to find other agents that provide a specific capability.
-*   **Payload:**
-    ```json
-    {
-      "capability_name": "string (the specific capability name being searched for)"
-      // "query_keywords": ["string"], // Alternative: search by keywords (currently secondary)
-    }
-    ```
-
-### 4.4. `SERVICES_AVAILABLE`
-*   **Direction:** Lobby -> Agent
-*   **Purpose:** The Lobby responds to a `DISCOVER_SERVICES` request, listing agents that match the query.
-*   **Payload:**
-    ```json
-    {
-      "services_found": [
-        {
-          "agent_id": "string",
-          "relevant_capabilities": [
-            // Array of Capability objects matching the query
-          ]
-        }
-      ],
-      "discovered_for_capability": "string (original capability_name from the DISCOVER_SERVICES request)"
-    }
-    ```
-
-### 4.5. `REQUEST`
+#### 7.3.1. `DIRECT_MESSAGE`
 *   **Direction:** Agent A -> Agent B (via Lobby)
-*   **Purpose:** Agent A requests Agent B to perform an action defined by one of Agent B's advertised capabilities.
+*   **Purpose:** For general, unstructured or custom-structured messages between agents that don't fit the formal `INVOKE_CAPABILITY` pattern. Can be used for chat, notifications, or simpler data exchanges.
 *   **Payload:**
     ```json
     {
-      "capability_name": "string (the name of the capability to invoke on Agent B)",
-      // ... other fields as defined by the capability's input_schema ...
-    }
-    ```
-    *Example for `initiate_item_search_v2`:*
-    ```json
-    {
-      "capability_name": "initiate_item_search_v2",
-      "item_to_find": "Bose QuietComfort headphones",
-      "target_website": "amazon.com"
+      "content_type": "string (e.g., 'application/json', 'text/plain', 'custom/my-format')",
+      "content": "any (JSON serializable data, string, or object, based on content_type)"
     }
     ```
 
-### 4.6. `RESPONSE`
+#### 7.3.2. `INVOKE_CAPABILITY_REQUEST`
+*   **Direction:** Agent A -> Agent B (via Lobby)
+*   **Purpose:** Agent A requests Agent B to execute a specific advertised capability.
+*   **Payload:**
+    ```json
+    {
+      "capability_name": "string (Full name of the capability to invoke)",
+      "capability_version": "string (Optional, specific version requested, e.g., '1.0.2')",
+      "input_data": { /* Object matching the target capability's input_schema */ }
+    }
+    ```
+
+#### 7.3.3. `INVOKE_CAPABILITY_RESPONSE`
 *   **Direction:** Agent B -> Agent A (via Lobby)
-*   **Purpose:** Agent B responds to a `REQUEST` from Agent A. Can indicate success or failure (with details).
+*   **Purpose:** Agent B responds to an `INVOKE_CAPABILITY_REQUEST`.
 *   **Payload:**
     ```json
     {
-      "status": "string ('success', 'error', 'in_progress', etc.)",
-      // ... other fields as defined by the capability's output_schema if successful ...
-      // ... or error details if status is 'error' (see Section 8) ...
+      "request_message_id": "string (message_id of the original INVOKE_CAPABILITY_REQUEST)",
+      "status": "string ('success', 'error', 'in_progress', 'pending_async')",
+      "output_data": { /* Object matching capability's output_schema if status is 'success' */ },
+      "error_details": { /* Error object if status is 'error' (see Section 8.2) */ },
+      "progress_info": { /* Optional, if status is 'in_progress' */
+          "percentage": "integer (0-100)",
+          "description": "string"
+      }
     }
     ```
-    *Example for successful `initiate_item_search_v2` leading to `find_cheapest_item_price_v2`:*
-    ```json
-    {
-        "status": "success",
-        "item_found_on_site": {
-            "name": "Bose Quietcomfort - Amazon.com",
-            "description": "...",
-            "regular_price": 128,
-            "source_website": "amazon.com",
-            "url": "http://amazon.com/Bose_QuietComfort_headphones_attempt1"
-        },
-        "cheapest_price_globally": {
-            "item_name": "Best Ever Laptop X1000", 
-            "cheapest_price": 108.8,
-            "source": "DiscountDealz.com (mock)",
-            "url": "http://mockdealz.com/Best_Ever_Laptop_X1000"
-        },
-        "message": "Search complete."
-    }
-    ```
-    *Example for an error response (e.g., unauthorized access):*
-    ```json
-    {
-        "status": "error",
-        "error": "Unauthorized: Agent 'rogue_007' is not authorized to call capability 'find_cheapest_item_price_v2' on agent 'price_hunter_A2_v2'."
-    }
-    ```
+    *If `status` is `pending_async`, Agent B acknowledges the request and will send one or more `INVOKE_CAPABILITY_RESPONSE` messages later (potentially with `in_progress` and finally `success` or `error`) using the same `conversation_id`.
 
-### 4.7. `ERROR`
-*   **Direction:** Lobby -> Agent or Agent -> Agent (via Lobby, less common for agent-to-agent)
-*   **Purpose:** Indicates a protocol-level error or a system error encountered by the Lobby or an agent when processing a message that isn't a direct response to a capability request.
+### 7.4. Lobby Communication
+
+#### 7.4.1. `LOBBY_BROADCAST`
+*   **Direction:** Lobby -> Agent(s) (receiver_id might be specific agent_id, a group, or `BROADCAST_ALL`)
+*   **Purpose:** Lobby sends announcements, system events, or other information to agents.
 *   **Payload:**
     ```json
     {
-      "error": "string (description of the error)",
-      "original_message_type": "string (optional, type of message that caused the error)",
-      "original_conversation_id": "string (optional, conv_id of message that caused error)"
+      "event_type": "string (e.g., 'system_maintenance', 'new_protocol_version', 'agent_joined_topic')",
+      "data": "object (Details specific to the event_type)"
     }
     ```
-    *Example: Lobby sends to agent if auth token is invalid for a DISCOVER_SERVICES request:*
+
+#### 7.4.2. `PING`
+*   **Direction:** Agent -> Lobby or Lobby -> Agent
+*   **Purpose:** Used to check connection liveness if WebSocket PING/PONG frames are not sufficient or if application-level pings are desired.
+*   **Payload:**
     ```json
     {
-        "error": "Authentication failed for message to lobby."
+      "nonce": "string (Optional, a random string to be echoed in PONG)"
     }
     ```
 
-## 5. Key Flows
+#### 7.4.3. `PONG`
+*   **Direction:** Agent -> Lobby or Lobby -> Agent
+*   **Purpose:** Response to a `PING` message.
+*   **Payload:**
+    ```json
+    {
+      "nonce": "string (Echoes nonce from the PING message, if provided)"
+    }
+    ```
 
-### 5.1. Agent Registration & Initialization
-1.  **Simulation Script:** `lobby.register_agent(agent_instance)`
-    *   Lobby creates an `auth_token` for the agent.
-    *   Lobby stores the agent instance and its capabilities (from `agent.get_capabilities()`).
-    *   Lobby assigns the `auth_token` and a `lobby_ref` to the agent instance.
-    *   Lobby logs `AGENT_REGISTERED`.
-2.  **Agent (in its `run` or `register_with_lobby` method):** Sends `REGISTER` message to `global_lobby`.
-    *   Payload contains its capabilities. `auth_token` is `None`.
-3.  **Lobby (`route_message`):**
-    *   Authenticates the message: For `REGISTER`, auth is considered "N/A_REGISTERING" and allowed to proceed.
-    *   Routes to `handle_lobby_message`.
-4.  **Lobby (`handle_lobby_message` for `REGISTER`):**
-    *   Finalizes registration details (though capabilities are already stored from `lobby.register_agent`).
-    *   Logs `AGENT_REGISTRATION_FINALIZED`.
-    *   Sends `REGISTER_ACK` message back to the agent, containing the `auth_token` previously generated and stored.
-5.  **Agent (`process_incoming_message`):** Receives `REGISTER_ACK` and confirms its token.
+### 7.5. Error Reporting
 
-### 5.2. Service Discovery
-1.  **Agent A (Requester):** Sends `DISCOVER_SERVICES` message to `global_lobby`.
-    *   Payload includes `capability_name`.
-    *   Includes its `auth_token`.
-2.  **Lobby (`route_message`):**
-    *   Authenticates Agent A's token. If valid, proceeds.
-    *   Routes to `handle_lobby_message`.
-3.  **Lobby (`handle_lobby_message` for `DISCOVER_SERVICES`):**
-    *   Searches its `agent_capabilities` for agents (excluding Agent A) that offer the specified `capability_name`.
-    *   Constructs a list of matching services.
-    *   Sends `SERVICES_AVAILABLE` message back to Agent A.
-4.  **Agent A (`process_incoming_message`):** Receives `SERVICES_AVAILABLE` and extracts `agent_id` of providers.
+#### 7.5.1. `PROTOCOL_ERROR`
+*   **Direction:** Lobby -> Agent or Agent -> Lobby
+*   **Purpose:** Indicates a problem related to the protocol itself (e.g., malformed message, invalid message type, authentication/authorization failure at protocol level).
+*   **Payload:** (See Section 8.2 for Error Object structure)
+    ```json
+    {
+      "error": { /* Error Object */ },
+      "offending_message_id": "string (Optional, message_id of the message that caused the error)"
+    }
+    ```
 
-### 5.3. Capability Invocation
-1.  **Agent A (Requester):** Sends `REQUEST` message to Agent B (target `agent_id`).
-    *   Payload includes `capability_name` and input data matching the capability's `input_schema`.
-    *   Includes its `auth_token`.
-    *   Includes a `conversation_id`.
-2.  **Lobby (`route_message`):**
-    *   Authenticates Agent A's token.
-    *   **Authorization Check:**
-        *   Retrieves the requested `capability_name` details for Agent B.
-        *   Checks if `authorized_requester_ids` is defined for this capability.
-        *   If defined, verifies if Agent A's `agent_id` is in the list.
-        *   If unauthorized:
-            *   Lobby sends a `RESPONSE` message with `status: "error"` and an error description back to Agent A (using the same `conversation_id`).
-            *   Logs `REQUEST_DENIED_AUTHORIZATION`.
-            *   Processing stops.
-        *   If authorized (or no restriction):
-            *   Logs `REQUEST_AUTHORIZED`.
-            *   Forwards the `REQUEST` message to Agent B.
-3.  **Agent B (`process_incoming_message`):** Receives the `REQUEST`.
-    *   Performs the capability action.
-    *   Sends a `RESPONSE` message back to Agent A (target `agent_id`), using the same `conversation_id`.
-        *   Payload includes `status` and output data (matching `output_schema`) or error details.
-4.  **Lobby (`route_message`):**
-    *   Authenticates Agent B's token.
-    *   Forwards the `RESPONSE` message to Agent A.
-5.  **Agent A (`process_incoming_message`):** Receives the `RESPONSE` for its `conversation_id`.
+## 8. Error Handling and Reporting
 
-## 6. Authentication
-*   Upon initial registration with the Lobby (via `lobby.register_agent()`), each agent is issued a unique UUID-based `auth_token`.
-*   This token is provided to the agent instance and also sent via the `REGISTER_ACK` message.
-*   Agents must include this `auth_token` in the `auth_token` field of all subsequent messages sent to the Lobby or other agents via the Lobby (except for the initial `REGISTER` message itself, which has `auth_token: null`).
-*   The Lobby validates this token for every message. If the token is missing (for non-REGISTER messages) or invalid, the Lobby will typically reject the message and may send an `ERROR` response to the sender.
+### 8.1. General Principles
+*   **Fail Fast:** Errors should be reported as soon as they are detected.
+*   **Clear Information:** Error messages should be informative enough for debugging.
+*   **Standard Format:** Use the defined error structures.
 
-## 7. Capability Definition
+### 8.2. Error Object Structure
+When a message payload includes error details (e.g., in `PROTOCOL_ERROR` or `INVOKE_CAPABILITY_RESPONSE` with status "error"), it SHOULD use the following structure:
 
-Agents advertise their services as a list of "Capability" objects. Each capability is a dictionary with the following structure:
-
-```typescript
-interface Capability {
-  name: string;                      // Unique name for the capability (e.g., "find_cheapest_item_price_v2")
-  description: string;               // Human-readable description
-  input_schema: Record<string, any>; // JSON schema defining the expected payload for a REQUEST to this capability
-  output_schema: Record<string, any>;// JSON schema defining the expected payload for a successful RESPONSE from this capability
-  keywords?: string[];                // Optional list of keywords for discovery
-  authorized_requester_ids?: string[] | null; // Optional. List of agent_ids authorized to call. `null` or omitted means public. An empty list `[]` also means public (or could be interpreted as "no one allowed" - currently public).
+```json
+{
+  "code": "string (A unique error code, e.g., 'AUTH_FAILED', 'CAPABILITY_NOT_FOUND', 'INVALID_PAYLOAD')",
+  "message": "string (Human-readable description of the error)",
+  "details": "object (Optional, additional structured information about the error)",
+  "retryable": "boolean (Optional, indicates if the operation might succeed on retry)"
 }
 ```
-*   **Schema Note:** `input_schema` and `output_schema` are intended to be JSON Schema objects. Currently, they are placeholder empty objects (`{}`) in some test agents. Future work should enforce these.
 
-## 8. Error Handling
+### 8.3. Common Error Codes (Examples)
 
-*   **Protocol Errors:** If the Lobby or an agent encounters an issue processing a message due to protocol violations (e.g., bad authentication, malformed message, capability not found, unauthorized request), it should respond to the original sender.
-    *   For authorization failures or capability-not-found issues during a `REQUEST`, the Lobby sends a `RESPONSE` message with `status: "error"` and an `error` field in the payload detailing the issue.
-    *   For other general errors (e.g., bad token on a `DISCOVER_SERVICES` call), the Lobby sends an `ERROR` message.
-*   **Application Errors:** If an agent successfully receives a valid `REQUEST` but encounters an internal error while executing the capability, it should send a `RESPONSE` message with `status: "error"` and appropriate error details in the payload, conforming to its `output_schema` for errors if defined.
+*   `AUTH_TOKEN_INVALID`, `AUTH_TOKEN_EXPIRED`, `API_KEY_INVALID`
+*   `ACCESS_DENIED` (Authorization failure)
+*   `MESSAGE_MALFORMED`, `INVALID_MESSAGE_TYPE`, `MISSING_REQUIRED_FIELD`
+*   `RECEIVER_UNAVAILABLE`, `RECEIVER_NOT_FOUND`
+*   `CAPABILITY_NOT_FOUND`, `CAPABILITY_VERSION_MISMATCH`
+*   `INVALID_PAYLOAD_SCHEMA` (Payload doesn't match capability schema)
+*   `RATE_LIMIT_EXCEEDED`
+*   `INTERNAL_LOBBY_ERROR`, `INTERNAL_AGENT_ERROR`
+*   `TIMEOUT_ERROR`
 
-## 9. Future Considerations (Beyond MVP v0.1.0)
-*   Schema validation enforcement for all message payloads against `input_schema` and `output_schema`.
-*   More sophisticated error codes and reporting.
-*   Agent-to-agent direct communication (bypassing Lobby after initial handshake/discovery, if desired for certain high-throughput interactions).
-*   Lobby scalability and fault tolerance.
-*   Dynamic capability updates (register/unregister after initial registration).
-*   Versioning of the protocol itself and individual capabilities. 
+## 9. Capability Definition
+
+Agents advertise their services as a list of "Capability" objects during registration (`REGISTER_CLIENT`).
+
+```json
+{
+  "name": "string (Globally unique name, namespaced recommended, e.g., 'com.example.TranslationService.translateText')",
+  "capability_version": "string (Semantic version, e.g., '1.0.2', '2.1.0-beta')",
+  "description": "string (Human-readable description)",
+  "input_schema": "object (JSON Schema defining the 'input_data' for INVOKE_CAPABILITY_REQUEST)",
+  "output_schema": "object (JSON Schema defining the 'output_data' for successful INVOKE_CAPABILITY_RESPONSE)",
+  "error_schema": "object (Optional, JSON Schema defining the 'error_details' for failed INVOKE_CAPABILITY_RESPONSE)",
+  "keywords": ["string"], // Optional list of keywords for discovery
+  "authorization_rules": { // Optional
+    "type": "string (e.g., 'allow_list', 'requires_role', 'public')",
+    "allowed_agent_ids": ["string"], // if type is 'allow_list'
+    "required_roles": ["string"] // if type is 'requires_role'
+  },
+  "metadata": "object (Optional, custom attributes, e.g., {'cost_per_call': 0.01, 'sla': '99.9%'})"
+}
+```
+*   **Schema Enforcement:** The Lobby MAY validate `INVOKE_CAPABILITY_REQUEST` input_data against the advertised `input_schema`. Agents MUST validate requests they receive.
+
+## 10. Communication Flows
+
+### 10.1. Agent Full Lifecycle
+1.  **Initial HTTP Registration:**
+    *   Agent (client SDK) -> Lobby: HTTP POST to `/api/v1/register` with API key, desired `agent_id`, `agent_type`.
+    *   Lobby -> Agent: HTTP Response with `auth_token`, `lobby_id`, or error.
+2.  **WebSocket Connection:**
+    *   Agent -> Lobby: Initiates WSS connection to `/ws/connect?token=<auth_token>&agent_id=<agent_id>`.
+    *   Lobby validates token/ID and establishes connection.
+3.  **Client Registration:**
+    *   Agent -> Lobby: `REGISTER_CLIENT` (capabilities, agent/sdk version).
+    *   Lobby -> Agent: `REGISTER_CLIENT_ACK` (status, session_id).
+4.  **Service Discovery:**
+    *   Agent A -> Lobby: `DISCOVER_CAPABILITIES` (filter).
+    *   Lobby -> Agent A: `CAPABILITIES_FOUND` (list of agents/capabilities).
+5.  **Capability Invocation (Agent A -> Agent B):**
+    *   Agent A -> Lobby: `INVOKE_CAPABILITY_REQUEST` (receiver_id=AgentB, capability_name, input_data). `conversation_id` set.
+    *   Lobby authenticates A, authorizes for B's capability, routes to Agent B.
+    *   Agent B -> Lobby: (Processes request) `INVOKE_CAPABILITY_RESPONSE` (receiver_id=AgentA, status, output_data/error_details). `conversation_id` matches.
+    *   Lobby routes to Agent A.
+6.  **Direct Message (Agent A -> Agent B):**
+    *   Agent A -> Lobby: `DIRECT_MESSAGE` (receiver_id=AgentB, content).
+    *   Lobby routes to Agent B. (Response is not mandated by this specific flow, can be another `DIRECT_MESSAGE`).
+7.  **Lobby Broadcast:**
+    *   Lobby -> Agent(s): `LOBBY_BROADCAST` (event_type, data).
+8.  **Keep-Alive:** PING/PONG exchanges occur periodically.
+9.  **Graceful Shutdown:**
+    *   Agent -> Lobby: `UNREGISTER_CLIENT`.
+    *   Agent closes WebSocket. Lobby updates status.
+
+## 11. Security Considerations
+
+*   **Transport Security:** All HTTP and WebSocket communication MUST use TLS (HTTPS/WSS).
+*   **Authentication:**
+    *   Initial: API Key based for HTTP registration.
+    *   Session: Bearer `auth_token` for WebSocket connection establishment. Tokens should be time-limited and securely managed.
+*   **Authorization:**
+    *   Lobby enforces capability-level authorization based on advertised rules.
+    *   Agents are responsible for finer-grained authorization within their own logic.
+*   **Input Validation:** Agents and Lobby (where applicable) MUST validate message payloads against defined schemas to prevent injection and processing errors.
+*   **Rate Limiting & Abuse Prevention:** The Lobby SHOULD implement mechanisms to prevent abuse (e.g., message rate limits per agent, connection limits).
+*   **Data Privacy:** Payloads are routed by the Lobby but not typically inspected beyond what's necessary for routing and protocol enforcement. End-to-end encryption for sensitive `DIRECT_MESSAGE` or capability payloads can be implemented at the application layer by agents if needed, but is outside the scope of this core protocol version.
+
+## 12. Extensibility & Versioning
+
+*   **Protocol Versioning:** The `protocol_version` field in the base message structure allows for future evolution.
+*   **Capability Versioning:** The `capability_version` field within the `Capability` definition allows individual services to evolve.
+*   **Custom Message Types:** While this document defines standard types, the ecosystem can support custom `message_type` values for specific applications, provided senders and receivers agree on their structure. These should be namespaced to avoid collision (e.g., `X_MYAPP_CUSTOM_EVENT`).
+*   **Metadata Field:** The `metadata` field in messages offers a flexible way to add custom information without altering core structures.
+
+## 13. Future Considerations
+
+*   Standardized topic-based publish/subscribe messaging.
+*   More sophisticated presence and status management.
+*   Binary payload support (e.g., via CBOR or Protocol Buffers alongside JSON).
+*   End-to-end encryption negotiation. 
