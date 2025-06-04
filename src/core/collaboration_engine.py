@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 import json
+import re
+from difflib import SequenceMatcher
 
 from .message import Message, MessageType, MessagePriority
 
@@ -96,6 +98,18 @@ class CollaborationEngine:
         self.collaboration_success_rates: Dict[tuple, float] = {}  # (agent1, agent2) -> success_rate
         self.agent_performance: Dict[str, Dict] = {}  # agent_id -> performance metrics
         
+    async def start(self):
+        """Start the collaboration engine"""
+        print("COLLAB ENGINE: Collaboration engine started")
+        # Initialize any background tasks or resources here if needed
+        pass
+        
+    async def stop(self):
+        """Stop the collaboration engine"""
+        print("COLLAB ENGINE: Collaboration engine stopped")
+        # Clean up resources, cancel tasks, etc.
+        pass
+        
     async def create_workflow(self, name: str, description: str, created_by: str, 
                             task_definitions: List[Dict[str, Any]]) -> str:
         """Create a new multi-agent workflow"""
@@ -115,15 +129,111 @@ class CollaborationEngine:
                 workflow_id=workflow_id,
                 name=task_def["name"],
                 required_capability=task_def["capability"],
-                input_data=task_def.get("input", {}),
+                input_data=task_def.get("input_data", {}),
                 dependencies=task_def.get("dependencies", []),
-                timeout_seconds=task_def.get("timeout", 300)
+                timeout_seconds=task_def.get("timeout_seconds", 300)
             )
             workflow.tasks[task_id] = task
             
         self.workflows[workflow_id] = workflow
         
         print(f"COLLAB ENGINE: Created workflow '{name}' with {len(task_definitions)} tasks")
+        return workflow_id
+    
+    async def create_goal_driven_workflow(self, name: str, description: str, created_by: str, 
+                                        task_intent: str, required_capabilities: List[str], 
+                                        task_data: Dict[str, Any], max_agents: int = 5) -> str:
+        """Create a goal-driven collaborative workflow with N-to-N agent collaboration"""
+        workflow_id = str(uuid.uuid4())
+        workflow = Workflow(
+            workflow_id=workflow_id,
+            name=name,
+            description=description,
+            created_by=created_by
+        )
+        
+        print(f"COLLAB ENGINE: Creating goal-driven workflow for capabilities: {required_capabilities}")
+        
+        # Find agents for collaboration based on goal similarity
+        suitable_agents = await self._find_agents_for_goal_collaboration(task_intent, required_capabilities, max_agents)
+        
+        # If no goal-similar agents found, fall back to capability-based selection
+        if not suitable_agents:
+            print(f"COLLAB ENGINE: No goal-similar agents found, falling back to capability-based selection")
+            fallback_agents = []
+            for capability in required_capabilities:
+                agents_for_cap = await self._find_agents_for_capability(capability)
+                fallback_agents.extend(agents_for_cap)
+            
+            # Remove duplicates and create agent info
+            unique_agents = list(set(fallback_agents))
+            suitable_agents = [{'agent_id': agent_id, 'goal_similarity': 0.0, 'capabilities': []} for agent_id in unique_agents]
+        
+        # **FIX: Create capability-specific tasks for true multi-agent collaboration**
+        capability_to_agents = {}
+        
+        # Map each capability to suitable agents
+        for capability in required_capabilities:
+            agents_for_cap = []
+            for agent_info in suitable_agents:
+                agent_id = agent_info['agent_id']
+                agent_data = self.lobby.agents.get(agent_id, {})
+                if isinstance(agent_data, dict):
+                    agent_capabilities = agent_data.get('capabilities', [])
+                    print(f"COLLAB ENGINE: Checking {agent_id} for {capability}: has {agent_capabilities}")
+                    if capability in agent_capabilities:
+                        agents_for_cap.append(agent_info)
+                        print(f"COLLAB ENGINE: ✅ {agent_id} matches {capability}")
+                    else:
+                        print(f"COLLAB ENGINE: ❌ {agent_id} does not have {capability}")
+            capability_to_agents[capability] = agents_for_cap
+        
+        print(f"COLLAB ENGINE: Capability mapping: {[(cap, len(agents)) for cap, agents in capability_to_agents.items()]}")
+        print(f"COLLAB ENGINE: Detailed mapping:")
+        for cap, agents in capability_to_agents.items():
+            agent_ids = [a['agent_id'] for a in agents]
+            print(f"  {cap}: {agent_ids}")
+        
+        # Create one task per capability (enables parallel multi-agent work)
+        for capability in required_capabilities:
+            agents_for_capability = capability_to_agents.get(capability, [])
+            
+            if agents_for_capability:
+                task_id = str(uuid.uuid4())
+                task_name = f"{name} - {capability.title()} Task"
+                
+                task = Task(
+                    task_id=task_id,
+                    workflow_id=workflow_id,
+                    name=task_name,
+                    required_capability=capability,  # Use specific capability for this task
+                    input_data={
+                        **task_data,
+                        'task_intent': task_intent,
+                        'capability_focus': capability,  # Tell agent which capability to focus on
+                        'collaboration_context': {
+                            'agent_role': f"{capability}_specialist",
+                            'total_capabilities': len(required_capabilities),
+                            'other_capabilities': [c for c in required_capabilities if c != capability],
+                            'collaboration_type': 'parallel_multi_agent'
+                        }
+                    },
+                    dependencies=[],
+                    timeout_seconds=task_data.get('deadline_minutes', 60) * 60
+                )
+                
+                # **FIX: Don't pre-assign agents - let dynamic assignment handle it**
+                # This allows the _assign_and_start_task function to properly distribute tasks
+                
+                workflow.tasks[task_id] = task
+                
+                print(f"COLLAB ENGINE: Created task '{task_name}' for capability '{capability}' (will be assigned dynamically)")
+            else:
+                print(f"COLLAB ENGINE: WARNING - No agents found for capability '{capability}'")
+        
+        self.workflows[workflow_id] = workflow
+        
+        print(f"COLLAB ENGINE: Created goal-driven workflow '{name}' with {len(workflow.tasks)} capability-specific tasks")
         return workflow_id
     
     async def start_workflow(self, workflow_id: str) -> bool:
@@ -166,74 +276,224 @@ class CollaborationEngine:
         return True
     
     async def _assign_and_start_task(self, task: Task, workflow: Workflow):
-        """Find suitable agent and assign task"""
-        # Find agents with required capability
-        suitable_agents = await self._find_agents_for_capability(task.required_capability)
+        """Assign a task to the most suitable agent and start execution"""
+        # Find agents with the required capability
+        capable_agents = await self._find_agents_for_capability(task.required_capability)
         
-        if not suitable_agents:
+        if not capable_agents:
             print(f"COLLAB ENGINE: No agents found for capability '{task.required_capability}'")
             task.status = TaskStatus.FAILED
             task.error = f"No agents available for capability: {task.required_capability}"
             return
         
-        # Select best agent (least loaded, highest success rate)
-        best_agent = self._select_best_agent(suitable_agents, task)
-        task.assigned_agent = best_agent
-        task.status = TaskStatus.ASSIGNED
-        task.started_at = datetime.now(timezone.utc)
+        # **FIX: Ensure different agents for different tasks in the same workflow**
+        # Get agents already assigned to this workflow
+        already_assigned = set()
+        for existing_task in workflow.tasks.values():
+            if existing_task.assigned_agent and existing_task.task_id != task.task_id:
+                already_assigned.add(existing_task.assigned_agent)
         
-        # Add to agent workload
+        print(f"COLLAB ENGINE: For task '{task.name}' (capability: {task.required_capability})")
+        print(f"COLLAB ENGINE: Found {len(capable_agents)} capable agents: {capable_agents}")
+        print(f"COLLAB ENGINE: Already assigned in workflow: {already_assigned}")
+        
+        # **FIX: Prefer agents NOT already assigned to this workflow**
+        available_agents = [agent_id for agent_id in capable_agents if agent_id not in already_assigned]
+        
+        if available_agents:
+            print(f"COLLAB ENGINE: {len(available_agents)} unassigned agents available: {available_agents}")
+            best_agent = self._select_best_agent(available_agents, task)
+        else:
+            print(f"COLLAB ENGINE: All capable agents already assigned - using best available anyway")
+            best_agent = self._select_best_agent(capable_agents, task)
+        
+        if not best_agent:
+            print(f"COLLAB ENGINE: Agent selection failed for task '{task.name}'")
+            task.status = TaskStatus.FAILED
+            task.error = "Agent selection failed"
+            return
+        
+        # Assign agent and track workload
+        task.assigned_agent = best_agent
         if best_agent not in self.agent_workloads:
             self.agent_workloads[best_agent] = set()
         self.agent_workloads[best_agent].add(task.task_id)
         
-        # Add agent to workflow participants
+        print(f"COLLAB ENGINE: ✅ Assigned task '{task.name}' to agent '{best_agent}'")
+        print(f"COLLAB ENGINE: Agent workload now: {len(self.agent_workloads[best_agent])} tasks")
+        
+        # Start task execution
+        task.status = TaskStatus.IN_PROGRESS
+        task.started_at = datetime.now(timezone.utc)
         workflow.participants.add(best_agent)
         
-        print(f"COLLAB ENGINE: Assigned task '{task.name}' to agent '{best_agent}'")
-        
-        # Send task to agent
         await self._send_task_to_agent(task, workflow, best_agent)
     
     async def _find_agents_for_capability(self, capability: str) -> List[str]:
         """Find all agents that have a specific capability"""
         suitable_agents = []
         
-        # Check lobby's agent capabilities
-        for agent_id, capabilities in self.lobby.agent_capabilities.items():
-            if capability in capabilities:
-                # Check if agent is online
-                if agent_id in self.lobby.agents:
+        # Check agents registered via HTTP API
+        for agent_id, agent_data in self.lobby.agents.items():
+            if isinstance(agent_data, dict):
+                # HTTP-registered agents have capabilities as a list
+                capabilities = agent_data.get('capabilities', [])
+                if capability in capabilities:
                     suitable_agents.append(agent_id)
+            else:
+                # Agent object instances - check agent_capabilities
+                if agent_id in self.lobby.agent_capabilities:
+                    capabilities_dict = self.lobby.agent_capabilities[agent_id]
+                    if capability in capabilities_dict:
+                        suitable_agents.append(agent_id)
         
+        print(f"COLLAB ENGINE: Found {len(suitable_agents)} agents for capability '{capability}': {suitable_agents}")
         return suitable_agents
     
+    async def _find_agents_for_goal_collaboration(self, task_intent: str, required_capabilities: List[str], max_agents: int = 5) -> List[Dict[str, Any]]:
+        """Find agents that can collaborate on a goal-driven task (N-to-N collaboration)"""
+        print(f"COLLAB ENGINE: Finding agents for goal collaboration - Intent: '{task_intent}', Capabilities: {required_capabilities}")
+        
+        candidate_agents = []
+        
+        # Check agents registered via HTTP API
+        for agent_id, agent_data in self.lobby.agents.items():
+            if isinstance(agent_data, dict):
+                agent_capabilities = agent_data.get('capabilities', [])
+                agent_goal = agent_data.get('goal', '')
+                agent_specialization = agent_data.get('specialization', '')
+                
+                # **FIX: Check if agent has any required capability**
+                capability_match = any(cap in agent_capabilities for cap in required_capabilities)
+                
+                print(f"COLLAB ENGINE: Agent {agent_id} capabilities: {agent_capabilities}")
+                print(f"COLLAB ENGINE: Required capabilities: {required_capabilities}")
+                print(f"COLLAB ENGINE: Capability match: {capability_match}")
+                
+                if capability_match:
+                    # Calculate goal similarity
+                    goal_similarity = self._calculate_goal_similarity(task_intent, agent_goal, agent_specialization)
+                    
+                    candidate_agents.append({
+                        'agent_id': agent_id,
+                        'goal_similarity': goal_similarity,
+                        'capabilities': agent_capabilities,
+                        'goal': agent_goal,
+                        'specialization': agent_specialization,
+                        'workload': len(self.agent_workloads.get(agent_id, set())),
+                        'performance': self.agent_performance.get(agent_id, {}).get("avg_success_rate", 0.5)
+                    })
+                    
+                    print(f"COLLAB ENGINE: ✅ Added {agent_id} as candidate (goal_similarity: {goal_similarity:.2f})")
+                else:
+                    print(f"COLLAB ENGINE: ❌ Skipped {agent_id} - no capability match")
+        
+        # **FIX: Don't limit by max_agents here - we need all capable agents for proper distribution**
+        # Sort by goal similarity and performance, but include ALL capable agents
+        candidate_agents.sort(key=lambda x: (x['goal_similarity'], x['performance'], -x['workload']), reverse=True)
+        
+        # Return all candidates instead of limiting to max_agents
+        selected_agents = candidate_agents  # **FIX: Return ALL capable agents**
+        
+        print(f"COLLAB ENGINE: Selected {len(selected_agents)} agents for collaboration:")
+        for agent in selected_agents:
+            print(f"  - {agent['agent_id']}: Goal similarity {agent['goal_similarity']:.2f}, Performance {agent['performance']:.2f}, Capabilities: {agent['capabilities']}")
+        
+        return selected_agents
+    
+    def _calculate_goal_similarity(self, task_intent: str, agent_goal: str, agent_specialization: str = '') -> float:
+        """Calculate semantic similarity between task intent and agent goal"""
+        if not task_intent or not agent_goal:
+            return 0.0
+        
+        # Normalize text for comparison
+        task_intent_clean = self._normalize_text(task_intent)
+        agent_goal_clean = self._normalize_text(agent_goal)
+        agent_spec_clean = self._normalize_text(agent_specialization)
+        
+        # Calculate base similarity using sequence matcher
+        base_similarity = SequenceMatcher(None, task_intent_clean, agent_goal_clean).ratio()
+        
+        # Bonus for specialization match
+        spec_bonus = 0.0
+        if agent_spec_clean and agent_spec_clean in task_intent_clean:
+            spec_bonus = 0.2
+        
+        # Keyword-based similarity boost
+        keyword_boost = self._calculate_keyword_similarity(task_intent_clean, agent_goal_clean, agent_spec_clean)
+        
+        # Combine similarities with weights
+        total_similarity = base_similarity + spec_bonus + keyword_boost
+        return min(total_similarity, 1.0)  # Cap at 1.0
+    
+    def _normalize_text(self, text: str) -> str:
+        """Normalize text for comparison"""
+        if not text:
+            return ""
+        return re.sub(r'[^a-z0-9\s]', '', text.lower()).strip()
+    
+    def _calculate_keyword_similarity(self, task_intent: str, agent_goal: str, agent_spec: str) -> float:
+        """Calculate keyword-based similarity boost"""
+        # Define related keyword groups for financial domain
+        financial_keywords = {
+            'content': ['blog', 'post', 'article', 'content', 'writing', 'social', 'media'],
+            'analysis': ['analysis', 'research', 'study', 'evaluation', 'assessment'],
+            'stocks': ['stock', 'equity', 'share', 'ticker', 'company', 'meta', 'facebook', 'nvda', 'nvidia'],
+            'finance': ['financial', 'finance', 'market', 'investment', 'trading', 'economic'],
+            'tracking': ['tracking', 'monitoring', 'data', 'metrics', 'performance', 'trends']
+        }
+        
+        task_words = set(task_intent.split())
+        agent_words = set(agent_goal.split() + agent_spec.split())
+        
+        keyword_matches = 0
+        total_keywords = 0
+        
+        for category, keywords in financial_keywords.items():
+            task_has_category = any(keyword in task_intent for keyword in keywords)
+            agent_has_category = any(keyword in ' '.join(agent_words) for keyword in keywords)
+            
+            if task_has_category:
+                total_keywords += 1
+                if agent_has_category:
+                    keyword_matches += 1
+        
+        return (keyword_matches / total_keywords * 0.3) if total_keywords > 0 else 0.0
+    
     def _select_best_agent(self, candidates: List[str], task: Task) -> str:
-        """Select the best agent for a task based on workload and performance"""
+        """Select the best agent for a task, prioritizing workload balance and performance"""
         if not candidates:
             return None
         
-        best_agent = None
-        best_score = -1
+        print(f"COLLAB ENGINE: Selecting best agent from {len(candidates)} candidates: {candidates}")
         
+        # Score each candidate
+        agent_scores = []
         for agent_id in candidates:
-            # Calculate score based on:
-            # 1. Current workload (lower is better)
-            # 2. Historical performance (higher is better)
-            # 3. Success rate with similar tasks
-            
             workload = len(self.agent_workloads.get(agent_id, set()))
             performance = self.agent_performance.get(agent_id, {}).get("avg_success_rate", 0.5)
             
-            # Simple scoring: performance - workload_penalty
-            workload_penalty = workload * 0.1
-            score = performance - workload_penalty
+            # **FIX: Simple scoring focused on workload balance and performance**
+            # Higher performance is better, lower workload is better
+            score = performance * 0.6 + (1.0 / (workload + 1)) * 0.4
             
-            if score > best_score:
-                best_score = score
-                best_agent = agent_id
+            agent_scores.append({
+                'agent_id': agent_id,
+                'score': score,
+                'workload': workload,
+                'performance': performance
+            })
+            
+            print(f"COLLAB ENGINE:   {agent_id}: workload={workload}, performance={performance:.2f}, score={score:.3f}")
         
-        return best_agent
+        # Sort by score (highest first)
+        agent_scores.sort(key=lambda x: x['score'], reverse=True)
+        
+        best_agent = agent_scores[0]
+        print(f"COLLAB ENGINE: ✅ Selected '{best_agent['agent_id']}' for '{task.required_capability}' "
+              f"(score: {best_agent['score']:.3f}, workload: {best_agent['workload']})")
+        
+        return best_agent['agent_id']
     
     async def _send_task_to_agent(self, task: Task, workflow: Workflow, agent_id: str):
         """Send a task to an agent for execution"""
@@ -257,7 +517,11 @@ class CollaborationEngine:
         )
         
         task.status = TaskStatus.IN_PROGRESS
-        await self.lobby.route_message(message)
+        
+        print(f"COLLAB ENGINE: Sending task '{task.name}' to agent '{agent_id}'")
+        
+        # Use _process_single_message for Message objects instead of route_message
+        await self.lobby._process_single_message(message)
     
     async def handle_task_result(self, message: Message):
         """Handle task completion from an agent"""
@@ -391,7 +655,7 @@ class CollaborationEngine:
             priority=MessagePriority.HIGH
         )
         
-        await self.lobby.route_message(message)
+        await self.lobby._process_single_message(message)
     
     # Real-time Collaboration Methods
     
@@ -434,7 +698,7 @@ class CollaborationEngine:
             conversation_id=collaboration.collab_id
         )
         
-        await self.lobby.route_message(message)
+        await self.lobby._process_single_message(message)
     
     async def broadcast_to_collaboration(self, collab_id: str, sender_id: str, content: Dict[str, Any]):
         """Broadcast a message to all participants in a collaboration"""
@@ -459,7 +723,7 @@ class CollaborationEngine:
                     conversation_id=collab_id
                 )
                 
-                await self.lobby.route_message(message)
+                await self.lobby._process_single_message(message)
                 collaboration.message_history.append(message.message_id)
         
         return True

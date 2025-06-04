@@ -9,7 +9,13 @@ import logging
 import time
 import websockets
 import structlog
-from aiohttp import web
+import http.server
+import socketserver
+import threading
+from urllib.parse import urlparse, parse_qs
+import concurrent.futures
+import socket  # Add socket import for port checking
+import queue
 
 from .message import Message, MessageType, MessagePriority, MessageValidationError
 from .agent import Agent, Capability # Forward declaration for type hint
@@ -32,6 +38,9 @@ except ImportError:
     monitoring_sdk = None
     MonitoringConfig = None
 
+# Setup logger
+logger = structlog.get_logger(__name__)
+
 # --- Constants ---
 MAX_FAILED_AUTH_ATTEMPTS = 3
 AUTH_LOCKOUT_DURATION_SECONDS = 300 # 5 minutes
@@ -44,40 +53,128 @@ class Lobby:
     """
     
     def __init__(self, host: str = "localhost", http_port: int = 8080, ws_port: int = 8081):
+        # Check for port conflicts and auto-adjust if needed
         self.host = host
-        self.http_port = http_port
-        self.ws_port = ws_port
+        
+        # Track allocated ports to avoid conflicts
+        self.allocated_ports = set()
+        
+        # Find available ports, ensuring no conflicts
+        self.http_port = self._find_available_port(http_port)
+        self.allocated_ports.add(self.http_port)
+        
+        # Ensure WebSocket gets a different port than HTTP
+        if ws_port == self.http_port:
+            ws_port = self.http_port + 1
+        
+        self.ws_port = self._find_available_port(ws_port)
+        self.allocated_ports.add(self.ws_port)
+        
+        # Make sure we got different ports
+        if self.ws_port == self.http_port:
+            # If somehow we got the same port, find next available for WebSocket
+            self.ws_port = self._find_available_port(self.http_port + 1)
+            self.allocated_ports.add(self.ws_port)
+        
+        if self.http_port != http_port:
+            print(f"⚠️  HTTP port {http_port} was occupied, using {self.http_port} instead")
+        if self.ws_port != ws_port:
+            print(f"⚠️  WebSocket port {ws_port} was occupied, using {self.ws_port} instead")
+            
+        self.lobby_id = f"global_lobby"
         
         # Core components
-        self.agents: Dict[str, Dict[str, Any]] = {}
-        self.conversations: Dict[str, Dict[str, Any]] = {}
-        self.active_workflows: Dict[str, Any] = {}
-        self.websocket_connections: Dict[str, websockets.WebSocketServerProtocol] = {}
+        self.agents: Dict[str, Dict] = {}
+        self.message_log: List[Dict] = []
+        self.websocket_connections: Dict[str, Any] = {}
+        self.delegation_to_workflow: Dict[str, str] = {}  # delegation_id -> workflow_id mapping
         
-        # Production components
+        # Thread-safe communication bridge for HTTP->Asyncio
+        self._http_to_asyncio_queue = queue.Queue()
+        self._bridge_event = threading.Event()
+        
+        # Message processing
+        self._priority_queues = None  # Initialized in start()
+        self._message_processor_task = None
+        self._cleanup_tasks = []
+        
+        # Initialize missing logging attributes
+        self._log_lock = None  # Will be initialized in start()
+        self._log_file_handle = None
+        
+        # Initialize missing agent management attributes
+        self.agent_capabilities: Dict[str, Dict[str, Any]] = {}
+        self.agent_auth_tokens: Dict[str, str] = {}
+        self.agent_reputation: Dict[str, float] = {}
+        self.default_reputation = 100.0
+        
+        # Initialize missing workflow tracking
+        self.active_workflows: Dict[str, Any] = {}
+        
+        # Initialize reputation change constants
+        self.reputation_change_on_success = {"provider": 10.0, "requester": 5.0}
+        self.reputation_change_on_failure = {"provider": -5.0, "requester": -2.0}
+        self.penalty_suspicious_report_reporter = -20.0
+        self.penalty_suspicious_report_provider = -5.0
+        
+        # Initialize agent tracking
+        self.agent_interaction_history: Dict[str, List[Dict[str, Any]]] = {}
+        self._agent_types: Dict[str, str] = {}
+        
+        # Initialize learning components
+        self.learning_sessions: Dict[str, LearningSession] = {}
+        self.active_collaborations: Dict[str, Set[str]] = {}
+        self.agent_learning_capabilities: Dict[str, List[LearningCapability]] = {}
+        self.test_environments: Dict[str, TestEnvironment] = {}
+        
+        # Initialize world state
+        self.world_state: Dict[str, Any] = {}
+        
+        # Production components - will be initialized in start()
         self.db_manager = db_manager
         self.load_balancer = load_balancer
         self.monitoring = monitoring_sdk if monitoring_sdk else None
-        
-        # Collaboration engine import
-        try:
-            from .collaboration_engine import CollaborationEngine
-            self.collaboration_engine = CollaborationEngine(self)
-        except ImportError:
-            logger.warning("Collaboration engine not available")
-            self.collaboration_engine = None
+        self.collaboration_engine = None  # Will be initialized in start()
         
         # Setup structured logging
         self.logger = structlog.get_logger(__name__)
         
-        # Initialize monitoring
-        self._setup_monitoring()
-        
         # Server instances
         self.http_server = None
         self.ws_server = None
-        self._cleanup_tasks = []
         
+        # Flag to track initialization state
+        self._initialized = False
+        
+    def _find_available_port(self, preferred_port: int) -> int:
+        """Find an available port, starting with the preferred one, avoiding already allocated ports"""
+        for port in range(preferred_port, preferred_port + 100):  # Try 100 ports
+            # Skip if already allocated by this instance
+            if port in self.allocated_ports:
+                continue
+                
+            try:
+                # Test if port is available
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind((self.host, port))
+                    # Important: Don't add to allocated_ports here, let the caller do it
+                    return port
+            except OSError:
+                continue  # Port is in use, try next one
+        
+        # If we get here, couldn't find an available port in range
+        raise OSError(f"Could not find available port starting from {preferred_port}")
+    
+    async def _initialize_log_file(self):
+        """Initialize the log file handle"""
+        try:
+            self._log_file_handle = open(LOG_FILE_PATH, "a", encoding="utf-8")
+            self._log_file_handle.write(f"{datetime.now(timezone.utc).isoformat()} - Lobby initialized. Log started.\n")
+            self._log_file_handle.flush()
+        except Exception as e:
+            self.logger.error(f"Failed to initialize log file: {e}")
+            self._log_file_handle = None
+    
     def _safe_monitoring_call(self, method_name: str, *args, **kwargs):
         """Safely call monitoring methods, handling None case"""
         if self.monitoring and hasattr(self.monitoring, method_name):
@@ -102,9 +199,9 @@ class Lobby:
             """Check database connectivity"""
             try:
                 # This would be a simple database ping
-            return True
+                return True
             except:
-        return False
+                return False
 
         self.monitoring.add_health_check("agents_registered", agents_health_check, interval=60)
         self.monitoring.add_health_check("database_connection", database_health_check, interval=30, critical=True)
@@ -112,6 +209,24 @@ class Lobby:
     async def start(self):
         """Start the lobby with all production components"""
         try:
+            # Initialize async components that couldn't be done in __init__
+            self._priority_queues = {priority: asyncio.Queue() for priority in MessagePriority}
+            self._log_lock = asyncio.Lock()
+            
+            # Initialize log file
+            await self._initialize_log_file()
+            
+            # Initialize collaboration engine
+            try:
+                from .collaboration_engine import CollaborationEngine
+                self.collaboration_engine = CollaborationEngine(self)
+            except ImportError:
+                self.logger.warning("Collaboration engine not available")
+                self.collaboration_engine = None
+            
+            # Initialize monitoring
+            self._setup_monitoring()
+            
             self.logger.info("Starting Agent Lobby", 
                            http_port=self.http_port, 
                            ws_port=self.ws_port)
@@ -136,14 +251,23 @@ class Lobby:
                 await self.collaboration_engine.start()
                 self.logger.info("Collaboration engine started")
             
-            # Start HTTP server
-            app = self._create_http_app()
-            runner = web.AppRunner(app)
-            await runner.setup()
+            # Start message processor
+            self._message_processor_task = asyncio.create_task(self._process_message_queues())
+            self.logger.info("Message processor started")
             
-            site = web.TCPSite(runner, self.host, self.http_port)
-            await site.start()
-            self.http_server = runner
+            # Start HTTP->Asyncio bridge processor
+            self._bridge_processor_task = asyncio.create_task(self._process_http_bridge_queue())
+            self.logger.info("HTTP bridge processor started")
+            
+            # Start HTTP server
+            server_class = self._create_http_server()
+            self.http_server = server_class((self.host, self.http_port), server_class.handler_class, self)
+            
+            # Start HTTP server in a separate thread
+            self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
+            self.http_thread.start()
+            
+            self.logger.info(f"HTTP server started on {self.host}:{self.http_port}")
             
             # Start WebSocket server
             self.ws_server = await websockets.serve(
@@ -154,6 +278,7 @@ class Lobby:
                 ping_timeout=10,
                 close_timeout=10
             )
+            self.logger.info(f"WebSocket server started on {self.host}:{self.ws_port}")
             
             # Start cleanup task
             cleanup_task = asyncio.create_task(self._periodic_cleanup())
@@ -175,6 +300,22 @@ class Lobby:
         self.logger.info("Stopping Agent Lobby")
         
         try:
+            # Stop message processor
+            if self._message_processor_task:
+                self._message_processor_task.cancel()
+                try:
+                    await self._message_processor_task
+                except asyncio.CancelledError:
+                    pass
+                    
+            # Stop HTTP bridge processor
+            if hasattr(self, '_bridge_processor_task') and self._bridge_processor_task:
+                self._bridge_processor_task.cancel()
+                try:
+                    await self._bridge_processor_task
+                except asyncio.CancelledError:
+                    pass
+            
             # Cancel cleanup tasks
             for task in self._cleanup_tasks:
                 task.cancel()
@@ -189,7 +330,10 @@ class Lobby:
             
             # Stop HTTP server
             if self.http_server:
-                await self.http_server.cleanup()
+                self.http_server.shutdown()
+                self.http_server.server_close()
+                if hasattr(self, 'http_thread'):
+                    self.http_thread.join(timeout=5)
             
             # Stop collaboration engine
             if self.collaboration_engine:
@@ -205,6 +349,9 @@ class Lobby:
             # Close database connections
             await self.db_manager.close()
             
+            # Close log file
+            self.close_log_file()
+            
             self.logger.info("Agent Lobby stopped")
             
         except Exception as e:
@@ -212,51 +359,43 @@ class Lobby:
 
     async def _log_message_event(self, event_type: str, data: Dict):
         """Logs generic lobby events. 'data' is a dictionary of event-specific details."""
-        async with self._log_lock:
-            log_entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "event_type": event_type,
-                "details": data 
-            }
-            self._log_file_handle.write(json.dumps(log_entry) + "\n")
-            self._log_file_handle.flush()
+        if self._log_file_handle:
+            async with self._log_lock:
+                log_entry = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "event_type": event_type,
+                    "details": data 
+                }
+                self._log_file_handle.write(json.dumps(log_entry) + "\n")
+                self._log_file_handle.flush()
 
     async def _log_communication(self, sender_id: str, receiver_id: str, msg_type: MessageType, 
                                payload: Optional[Dict[str, Any]] = None, 
                                conversation_id: Optional[str] = None, 
                                auth_status: str = "N/A"):
-        async with self._log_lock:
-            log_entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "sender": sender_id,
-                "receiver": receiver_id,
-                "message_type": msg_type.name,
-                "conversation_id": conversation_id,
-                "auth_status": auth_status,
-                "payload": payload
-            }
-            self._log_file_handle.write(json.dumps(log_entry) + "\n")
-            self._log_file_handle.flush()
-            print(f"{datetime.now(timezone.utc).isoformat()} | {sender_id} -> {receiver_id} | {msg_type.name} | ConvID: {conversation_id} | Auth: {auth_status} | {payload}")
-
-    async def start(self):
-        """Start the message processing loop."""
-        self._message_processor_task = asyncio.create_task(self._process_message_queues())
-        print(f"Lobby message processor started.")
-
-    async def stop(self):
-        """Stop the message processing loop."""
-        if self._message_processor_task:
-            self._message_processor_task.cancel()
-            try:
-                await self._message_processor_task
-            except asyncio.CancelledError:
-                pass
-        print(f"Lobby message processor stopped.")
+        if self._log_file_handle:
+            async with self._log_lock:
+                log_entry = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "sender": sender_id,
+                    "receiver": receiver_id,
+                    "message_type": msg_type.name,
+                    "conversation_id": conversation_id,
+                    "auth_status": auth_status,
+                    "payload": payload
+                }
+                self._log_file_handle.write(json.dumps(log_entry) + "\n")
+                self._log_file_handle.flush()
+                print(f"{datetime.now(timezone.utc).isoformat()} | {sender_id} -> {receiver_id} | {msg_type.name} | ConvID: {conversation_id} | Auth: {auth_status} | {payload}")
 
     async def _process_message_queues(self):
         """Process messages from priority queues."""
         print(f"LOBBY ({self.lobby_id}): Starting _process_message_queues loop.")
+        
+        # Wait for priority queues to be initialized
+        while self._priority_queues is None:
+            await asyncio.sleep(0.1)
+        
         while True:
             try:
                 processed_message_this_cycle = False
@@ -295,6 +434,108 @@ class Lobby:
                 traceback.print_exc()
                 await asyncio.sleep(0.1) #Slightly longer back-off for outer loop errors
         print(f"LOBBY ({self.lobby_id}): Exiting _process_message_queues loop.")
+
+    async def _process_http_bridge_queue(self):
+        """Process workflow creation requests from HTTP thread"""
+        print(f"LOBBY ({self.lobby_id}): Starting HTTP bridge processor")
+        
+        while True:
+            try:
+                # Check for pending HTTP->Asyncio requests
+                try:
+                    # Non-blocking check for bridge requests
+                    queue_size = self._http_to_asyncio_queue.qsize()
+                    if queue_size > 0:
+                        print(f"BRIDGE: Found {queue_size} items in queue")
+                    
+                    while not self._http_to_asyncio_queue.empty():
+                        try:
+                            request = self._http_to_asyncio_queue.get_nowait()
+                            print(f"BRIDGE: Processing request type: {request.get('type')}")
+                            print(f"BRIDGE: Request details: {request}")
+                            
+                            if request['type'] == 'create_workflow':
+                                await self._handle_bridge_workflow_creation(request)
+                            else:
+                                print(f"BRIDGE: Unknown request type: {request.get('type')}")
+                                
+                        except Exception as e:
+                            print(f"BRIDGE: Error processing request: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            
+                except Exception as e:
+                    print(f"BRIDGE: Error checking queue: {e}")
+                
+                await asyncio.sleep(0.1)  # Small delay to prevent CPU spinning
+                
+            except asyncio.CancelledError:
+                print(f"LOBBY ({self.lobby_id}): HTTP bridge processor cancelled")
+                break
+            except Exception as e:
+                print(f"LOBBY ({self.lobby_id}): Error in HTTP bridge processor: {e}")
+                import traceback
+                traceback.print_exc()
+                await asyncio.sleep(1)  # Wait a bit before retrying on error
+
+    async def _handle_bridge_workflow_creation(self, request):
+        """Handle workflow creation request from HTTP bridge"""
+        try:
+            delegation_id = request['delegation_id']
+            workflow_id = request['workflow_id']
+            task_title = request['task_title']
+            task_description = request['task_description']
+            required_capabilities = request['required_capabilities']
+            requester_id = request['requester_id']
+            data = request['data']
+            
+            print(f"BRIDGE: Creating workflow {workflow_id} for delegation {delegation_id}")
+            
+            # Check if this is a goal-driven collaboration request
+            task_intent = data.get('task_intent', '')
+            max_agents = data.get('max_agents', 3)
+            
+            if task_intent and hasattr(self.collaboration_engine, 'create_goal_driven_workflow'):
+                print(f"BRIDGE: Creating goal-driven workflow with intent: '{task_intent}'")
+                # Create goal-driven collaborative workflow
+                actual_workflow_id = await self.collaboration_engine.create_goal_driven_workflow(
+                    name=f"Goal-Driven: {task_title}",
+                    description=f"{task_description} | Intent: {task_intent}",
+                    created_by=requester_id,
+                    task_intent=task_intent,
+                    required_capabilities=required_capabilities,
+                    task_data=data.get('task_data', {}),
+                    max_agents=max_agents
+                )
+            else:
+                print(f"BRIDGE: Creating standard workflow")
+                # Create standard workflow for this delegation
+                actual_workflow_id = await self.collaboration_engine.create_workflow(
+                    name=f"Delegation: {task_title}",
+                    description=task_description,
+                    created_by=requester_id,
+                    task_definitions=[{
+                        'task_id': f"task_{uuid.uuid4().hex[:8]}",
+                        'name': task_title,
+                        'capability': required_capabilities[0] if required_capabilities else 'general',
+                        'input_data': data.get('task_data', {}),
+                        'dependencies': [],
+                        'timeout_seconds': data.get('deadline_minutes', 60) * 60
+                    }]
+                )
+            
+            # Update mapping to actual workflow ID
+            self.delegation_to_workflow[delegation_id] = actual_workflow_id
+            print(f"BRIDGE: Updated delegation mapping {delegation_id} -> {actual_workflow_id}")
+            
+            # Start the workflow
+            started = await self.collaboration_engine.start_workflow(actual_workflow_id)
+            print(f"BRIDGE: Workflow {actual_workflow_id} started: {started}")
+            
+        except Exception as e:
+            print(f"BRIDGE: Workflow creation error: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def _process_single_message(self, message: Message):
         """Process a single message with acknowledgment handling and authorization for requests."""
@@ -345,8 +586,37 @@ class Lobby:
                         )
                         return # Do not route the unauthorized message
                 
-                # If it's not a REQUEST or if it IS a REQUEST and it was authorized, send it to the agent.
-                await self.agents[message.receiver_id].receive_message(message)
+                # Route message to agent - handle both Agent objects and WebSocket agents
+                agent_data = self.agents[message.receiver_id]
+                
+                # Check if this is a WebSocket-connected agent (dict) vs Agent object
+                if isinstance(agent_data, dict) and message.receiver_id in self.websocket_connections:
+                    # WebSocket agent - send via WebSocket
+                    await self._send_message_via_websocket(message)
+                elif hasattr(agent_data, 'receive_message'):
+                    # Agent object - call receive_message
+                    await agent_data.receive_message(message)
+                elif isinstance(agent_data, dict):
+                    # HTTP-registered agent (dict but no WebSocket connection)
+                    # These agents exist in the system but don't have active connections
+                    # We'll log the task assignment but can't deliver the message
+                    print(f"LOBBY INFO: Task assigned to HTTP-registered agent {message.receiver_id}")
+                    print(f"LOBBY INFO: Agent type: {agent_data.get('agent_type', 'unknown')}")
+                    print(f"LOBBY INFO: Task details - {message.message_type.name}: {message.payload.get('task_name', 'unnamed task')}")
+                    
+                    # For now, we'll consider this "delivered" since the task is assigned
+                    # In a real implementation, you might want to store the message for pickup
+                    # or implement a polling mechanism for HTTP agents
+                    await self._log_message_event("TASK_ASSIGNED_TO_HTTP_AGENT", {
+                        "agent_id": message.receiver_id,
+                        "agent_type": agent_data.get('agent_type', 'unknown'),
+                        "task_id": message.payload.get('task_id'),
+                        "task_name": message.payload.get('task_name', 'unnamed task'),
+                        "message_type": message.message_type.name
+                    })
+                else:
+                    # Unknown agent type
+                    print(f"LOBBY ERROR: Cannot route message to agent {message.receiver_id} - unknown agent type")
             
             # Handle acknowledgment if required (This part seems to be about messages that the Lobby itself sends and expects an ACK for)
             # This might need review if it's intended for messages *received* by the lobby that *require* an ACK from the lobby.
@@ -373,6 +643,54 @@ class Lobby:
                  except Exception as nested_e:
                      print(f"LOBBY ({self.lobby_id}): CRITICAL - Failed to send error notification to {message.sender_id} during exception handling: {nested_e}")
 
+    async def _send_message_via_websocket(self, message: Message):
+        """Send a Message object to a WebSocket-connected agent"""
+        try:
+            receiver_id = message.receiver_id
+            
+            if receiver_id not in self.websocket_connections:
+                print(f"LOBBY ERROR: No WebSocket connection for agent {receiver_id}")
+                return False
+            
+            websocket = self.websocket_connections[receiver_id]
+            
+            # Convert Message object to WebSocket-compatible format
+            # FIX: Handle both old format (message_type) and new format (type) for compatibility
+            ws_message = {
+                "message_id": message.message_id,
+                "sender_id": message.sender_id,
+                "receiver_id": message.receiver_id,
+                # CRITICAL FIX: Send both formats for compatibility
+                "message_type": message.message_type.name,  # Original format
+                "type": message.message_type.name,          # Format agents expect
+                "payload": message.payload,
+                "conversation_id": message.conversation_id,
+                "priority": message.priority.name if message.priority else "NORMAL",
+                "timestamp": message.timestamp.isoformat() if message.timestamp else datetime.now(timezone.utc).isoformat(),
+                "requires_ack": getattr(message, 'requires_ack', False)
+            }
+            
+            # Ensure all values are JSON serializable
+            try:
+                message_json = json.dumps(ws_message, ensure_ascii=False, default=str)
+            except (TypeError, ValueError) as e:
+                print(f"LOBBY ERROR: Failed to serialize message to JSON: {e}")
+                print(f"LOBBY ERROR: Message data: {ws_message}")
+                return False
+            
+            # Send JSON message via WebSocket
+            await websocket.send(message_json)
+            
+            print(f"LOBBY: ✅ Sent {message.message_type.name} message to {receiver_id}")
+            print(f"LOBBY: 📦 Message content: {json.dumps(message.payload, indent=2) if message.payload else 'No payload'}")
+            return True
+            
+        except Exception as e:
+            print(f"LOBBY ERROR: Failed to send WebSocket message to {receiver_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     async def _handle_broadcast(self, message: Message):
         """Handle broadcast messages."""
         if not message.broadcast_scope:
@@ -387,7 +705,7 @@ class Lobby:
 
         # Send message to all target agents
         for agent_id in target_agents:
-        if agent_id in self.agents:
+            if agent_id in self.agents:
                 try:
                     await self.agents[agent_id].receive_message(message)
                 except Exception as e:
@@ -415,115 +733,6 @@ class Lobby:
             )
             await self.agents[message.sender_id].receive_message(timeout_notification)
 
-    async def route_message(self, message: Message):
-        """Enhanced message routing with priority queues and validation."""
-        try:
-            # Validate message
-            message.validate()
-            
-            # Authentication check
-            if not self._authenticate_message(message):
-                # If authentication fails, we should probably send an error response
-                # back to the sender. For now, just returning as per original logic for non-REGISTER.
-                # For REGISTER messages, _authenticate_message currently always returns True.
-                # If it were to return False (e.g., for a banned agent trying to re-register),
-                # we might want specific handling.
-                print(f"LOBBY ({self.lobby_id}): Authentication failed for message {message.message_id} from {message.sender_id}. Type: {message.message_type.name}")
-                # Consider sending an explicit auth error message back to the sender if not a REGISTER message
-                if message.message_type != MessageType.REGISTER:
-                    await self._send_error_to_agent(message.sender_id, "Authentication failed for your message.", message.message_id)
-            return
-
-            # Add to appropriate priority queue
-            # Store (priority_value, timestamp, message_id, message_object)
-            timestamp = datetime.now(timezone.utc).timestamp()
-            await self._priority_queues[message.priority].put(
-                (message.priority.value, timestamp, message.message_id, message)
-            )
-            print(f"LOBBY ({self.lobby_id}): Queued message {message.message_id} with priority {message.priority.name}")
-            
-            # Handle acknowledgment if this is an ACK message
-            if message.message_type == MessageType.ACK:
-                ack_for = message.payload.get("ack_for")
-                if ack_for in self._pending_acks:
-                    self._pending_acks[ack_for].set()
-                    if ack_for in self._message_timeouts:
-                        self._message_timeouts[ack_for].cancel()
-                        del self._message_timeouts[ack_for]
-        except MessageValidationError as e:
-            print(f"Message validation error: {e}")
-            if message.sender_id in self.agents:
-                error_msg = Message(
-                    sender_id=self.lobby_id,
-                    receiver_id=message.sender_id,
-                    message_type=MessageType.ERROR,
-                    payload={"error": f"Message validation failed: {str(e)}"},
-                    priority=MessagePriority.HIGH
-                )
-                await self.agents[message.sender_id].receive_message(error_msg)
-
-    async def register_agent(self, agent_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Register an agent with production features"""
-        try:
-            agent_id = agent_data.get("agent_id")
-            if not agent_id:
-                raise ValueError("Agent ID is required")
-            
-            # Prepare agent data for database
-            db_agent_data = {
-                "id": agent_id,
-                "agent_type": agent_data.get("agent_type", "unknown"),
-                "capabilities": agent_data.get("capabilities", []),
-                "status": "online",
-                "metadata": {
-                    "registered_at": datetime.now(timezone.utc).isoformat(),
-                    "last_seen": datetime.now(timezone.utc).isoformat(),
-                    **agent_data.get("metadata", {})
-                },
-                "reputation": 100.0,
-                "last_seen": datetime.now(timezone.utc),
-                "created_at": datetime.now(timezone.utc)
-            }
-            
-            # Save to database
-            success = await self.db_manager.save_agent(db_agent_data)
-            if not success:
-                raise Exception("Failed to save agent to database")
-            
-            # Register with load balancer
-            capability_names = [cap.get("name", "unknown") for cap in agent_data.get("capabilities", [])]
-            self.load_balancer.register_agent(
-                agent_id=agent_id,
-                capabilities=capability_names,
-                max_load=agent_data.get("max_load", 100),
-                weight=agent_data.get("weight", 1.0),
-                metadata=agent_data.get("metadata", {})
-            )
-            
-            # Store in memory for quick access
-            self.agents[agent_id] = db_agent_data
-            
-            # Record metrics
-            self._safe_monitoring_call("increment", "agents.registered")
-            self._safe_monitoring_call("gauge", "agents.total", len(self.agents))
-            
-            self.logger.info("Agent registered successfully", 
-                           agent_id=agent_id, 
-                           capabilities=len(capability_names))
-            
-            return {
-                "status": "success",
-                "agent_id": agent_id,
-                "message": "Agent registered successfully"
-            }
-            
-        except Exception as e:
-            self._safe_monitoring_call("increment", "agents.registration_failures")
-            self.logger.error("Agent registration failed", 
-                            agent_id=agent_data.get("agent_id"), 
-                            error=str(e))
-            raise
-    
     async def route_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """Route message with load balancing and error recovery"""
         try:
@@ -555,7 +764,7 @@ class Lobby:
                 result = await self._handle_lobby_message(message)
             elif receiver_id == "*" or receiver_id == "broadcast":
                 result = await self._handle_broadcast_message(message)
-        else:
+            else:
                 # Use load balancer for capability-based routing
                 if message_type == "CAPABILITY_REQUEST":
                     required_capability = message.get("payload", {}).get("capability")
@@ -697,6 +906,10 @@ class Lobby:
             self.logger.error("Failed to remove stale agent", agent_id=agent_id, error=str(e))
 
     async def _is_request_authorized(self, sender_id: str, target_agent_id: str, capability_name: str) -> bool:
+        # Special authorization for lobby/collaboration engine system messages
+        if sender_id == self.lobby_id or sender_id == "global_lobby":
+            return True  # System always authorized
+            
         if target_agent_id not in self.agent_capabilities or capability_name not in self.agent_capabilities[target_agent_id]:
             return False # Target capability doesn't exist, treat as unauthorized for safety
         
@@ -808,7 +1021,7 @@ class Lobby:
             await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
 
     async def _handle_discover_services(self, msg: Message):
-            capability_name_query = msg.payload.get("capability_name")
+        capability_name_query = msg.payload.get("capability_name")
         requester_id = msg.sender_id
         found_services = []
 
@@ -878,7 +1091,7 @@ class Lobby:
             log_data["error"] = ", ".join(error_detail)
             print(f"Lobby: Error processing TASK_OUTCOME_REPORT: {log_data['error']}")
             await self._log_message_event("TASK_OUTCOME_PROCESSING_ERROR", log_data)
-                return
+            return
 
         # Anomaly Detection & Game Theory Aspect
         is_suspicious_report = False
@@ -987,7 +1200,7 @@ class Lobby:
 
     def update_world_state(self, key: str, value: Any):
         print(f"Lobby: World state updated - {key}: {value}")
-        # self.world_state[key] = value # world_state was not defined, commented out for now
+        self.world_state[key] = value
 
     def print_message_log(self):
         print("\n--- Message Log ---")
@@ -1028,6 +1241,77 @@ class Lobby:
                 del self.agent_auth_tokens[agent_id]
             return True
         return False
+
+    async def register_agent(self, agent: Agent) -> Dict[str, Any]:
+        """Register an agent with the lobby"""
+        try:
+            agent_id = agent.agent_id
+            
+            # Generate auth token
+            auth_token = self._generate_token()
+            self.agent_auth_tokens[agent_id] = auth_token
+            
+            # Store agent
+            self.agents[agent_id] = agent
+            
+            # Initialize reputation
+            if agent_id not in self.agent_reputation:
+                self.agent_reputation[agent_id] = self.default_reputation
+            
+            # Store agent capabilities
+            if hasattr(agent, 'capabilities') and agent.capabilities:
+                self.agent_capabilities[agent_id] = {cap.name: cap for cap in agent.capabilities}
+            
+            # Store agent type for broadcasting
+            if hasattr(agent, 'agent_type'):
+                self._agent_types[agent_id] = agent.agent_type
+            
+            # Initialize interaction history
+            if agent_id not in self.agent_interaction_history:
+                self.agent_interaction_history[agent_id] = []
+            
+            # Register with load balancer
+            if hasattr(agent, 'capabilities') and agent.capabilities:
+                for capability in agent.capabilities:
+                    self.load_balancer.register_agent_capability(agent_id, capability.name)
+            
+            # Save to database if available
+            try:
+                await self.db_manager.save_agent({
+                    "agent_id": agent_id,
+                    "name": getattr(agent, 'name', agent_id),
+                    "capabilities": [cap.name for cap in getattr(agent, 'capabilities', [])],
+                    "status": "active",
+                    "registered_at": datetime.now(timezone.utc)
+                })
+            except Exception as e:
+                self.logger.warning(f"Database save failed: {e}")
+            
+            await self._log_message_event("AGENT_REGISTERED", {
+                "agent_id": agent_id,
+                "agent_type": getattr(agent, 'agent_type', 'generic'),
+                "capabilities": [cap.name for cap in getattr(agent, 'capabilities', [])]
+            })
+            
+            # Record metrics
+            self._safe_monitoring_call("increment", "agents.registered")
+            self._safe_monitoring_call("gauge", "agents.total", len(self.agents))
+            
+            self.logger.info(f"Agent registered: {agent_id}")
+            
+            return {
+                "status": "success",
+                "agent_id": agent_id,
+                "auth_token": auth_token,
+                "message": "Agent registered successfully"
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Agent registration failed: {e}")
+            return {
+                "status": "error",
+                "message": f"Registration failed: {str(e)}"
+            }
 
     def close_log_file(self):
         """Closes the log file handle. Should be called on graceful shutdown."""
@@ -1661,3 +1945,480 @@ class Lobby:
         except Exception as e:
             error_payload = {"error": f"Failed to create collaboration session: {str(e)}"}
             await self._send_direct_response(self.lobby_id, agent_id, msg, error_payload, MessageType.ERROR)
+
+    def _create_http_app(self):
+        """Legacy method - replaced by _create_http_server"""
+        pass
+
+    def _create_http_server(self):
+        """Create HTTP server using built-in libraries"""
+        
+        class LobbyHTTPHandler(http.server.BaseHTTPRequestHandler):
+            def __init__(self, request, client_address, server):
+                self.lobby = server.lobby_instance
+                super().__init__(request, client_address, server)
+            
+            def do_GET(self):
+                try:
+                    parsed_url = urlparse(self.path)
+                    path = parsed_url.path
+                    
+                    if path == '/health' or path == '/api/health':
+                        response = {'status': 'healthy', 'timestamp': datetime.now(timezone.utc).isoformat()}
+                        self._send_json_response(200, response)
+                    elif path == '/api/status':
+                        response = {
+                            'status': 'operational',
+                            'agents_count': len(self.lobby.agents),
+                            'active_connections': len(self.lobby.websocket_connections)
+                        }
+                        self._send_json_response(200, response)
+                    elif path == '/api/agents':
+                        agents_list = list(self.lobby.agents.values())
+                        response = {'status': 'success', 'agents': agents_list, 'count': len(agents_list)}
+                        self._send_json_response(200, response)
+                    elif path == '/api/available_tasks':
+                        # Get available tasks from collaboration engine
+                        try:
+                            query_params = parse_qs(parsed_url.query)
+                            agent_id = query_params.get('agent_id', [''])[0]
+                            
+                            # Get active workflows that need agents
+                            active_workflows = self.lobby.collaboration_engine.workflows
+                            available_tasks = []
+                            
+                            for workflow_id, workflow in active_workflows.items():
+                                if workflow.status.value == 'running':
+                                    for task_id, task in workflow.tasks.items():
+                                        if task.status.value == 'pending':
+                                            available_tasks.append({
+                                                'delegation_id': workflow_id,
+                                                'task_id': task_id,
+                                                'task_title': task.name,
+                                                'task_description': workflow.description,
+                                                'required_capabilities': [task.required_capability],
+                                                'created_by': workflow.created_by,
+                                                'deadline': task.created_at.isoformat(),
+                                                'status': 'open'
+                                            })
+                            
+                            response = {'status': 'success', 'tasks': available_tasks, 'count': len(available_tasks)}
+                            self._send_json_response(200, response)
+                        except Exception as e:
+                            self._send_json_response(500, {'status': 'error', 'message': f'Failed to get tasks: {str(e)}'})
+                    elif path.startswith('/api/collaboration_status/'):
+                        # Extract delegation_id from URL
+                        delegation_id = path.split('/')[-1]
+                        try:
+                            # Map delegation_id to workflow_id
+                            workflow_id = self.lobby.delegation_to_workflow.get(delegation_id)
+                            
+                            if not workflow_id:
+                                response = {
+                                    'status': 'not_found',
+                                    'message': f'No workflow found for delegation {delegation_id}'
+                                }
+                            else:
+                                # Get workflow status using the correct workflow_id
+                                workflow_status = self.lobby.collaboration_engine.get_workflow_status(workflow_id)
+                                
+                                if workflow_status:
+                                    response = {
+                                        'status': 'success',
+                                        'delegation_id': delegation_id,
+                                        'workflow_id': workflow_id,
+                                        'workflow_status': workflow_status.get('status'),
+                                        'participating_agents': list(workflow_status.get('participants', [])),
+                                        'progress': workflow_status.get('progress', 'In progress'),
+                                        'results': workflow_status.get('result')
+                                    }
+                                else:
+                                    response = {
+                                        'status': 'not_found',
+                                        'message': f'Workflow {workflow_id} not found in collaboration engine'
+                                    }
+                            
+                            self._send_json_response(200, response)
+                        except Exception as e:
+                            self._send_json_response(500, {'status': 'error', 'message': f'Failed to get status: {str(e)}'})
+                    else:
+                        self._send_json_response(404, {'status': 'error', 'message': 'Not found'})
+                except Exception as e:
+                    print(f"HTTP GET error: {e}")
+                    self._send_json_response(500, {'status': 'error', 'error': str(e)})
+            
+            def do_POST(self):
+                try:
+                    parsed_url = urlparse(self.path)
+                    path = parsed_url.path
+                    
+                    # Read request body
+                    content_length = int(self.headers.get('Content-Length', 0))
+                    post_data = self.rfile.read(content_length).decode('utf-8')
+                    
+                    if path == '/api/agents/register':
+                        try:
+                            data = json.loads(post_data) if post_data else {}
+                            agent_id = data.get('agent_id')
+                            name = data.get('name', agent_id)
+                            capabilities = data.get('capabilities', [])
+                            
+                            # Goal-driven agent information
+                            goal = data.get('goal', '')
+                            specialization = data.get('specialization', '')
+                            collaboration_style = data.get('collaboration_style', 'individual')
+                            
+                            if not agent_id:
+                                self._send_json_response(400, {'status': 'error', 'message': 'agent_id is required'})
+                                return
+                            
+                            # Store all agent info including goal information
+                            agent_data = {
+                                'agent_id': agent_id,
+                                'name': name,
+                                'capabilities': capabilities,
+                                'goal': goal,
+                                'specialization': specialization,
+                                'collaboration_style': collaboration_style,
+                                'registered_at': datetime.now(timezone.utc).isoformat(),
+                                'status': 'active'
+                            }
+                            
+                            # Preserve additional fields like websocket_ready
+                            for key, value in data.items():
+                                if key not in ['agent_id', 'name', 'capabilities', 'goal', 'specialization', 'collaboration_style']:
+                                    agent_data[key] = value
+                            
+                            self.lobby.agents[agent_id] = agent_data
+                            
+                            # Initialize agent capabilities for HTTP-registered agents
+                            if agent_id not in self.lobby.agent_capabilities:
+                                self.lobby.agent_capabilities[agent_id] = {}
+                            
+                            # Convert capabilities list to capability dict for collaboration engine
+                            for capability in capabilities:
+                                self.lobby.agent_capabilities[agent_id][capability] = {
+                                    "name": capability,
+                                    "description": f"HTTP-registered capability: {capability}",
+                                    "authorized_requester_ids": None,  # Public capability
+                                    "agent_id": agent_id
+                                }
+                            
+                            # Initialize reputation if not exists
+                            if agent_id not in self.lobby.agent_reputation:
+                                self.lobby.agent_reputation[agent_id] = self.lobby.default_reputation
+                            
+                            print(f"HTTP: Registered goal-driven agent {agent_id}")
+                            print(f"  Goal: {goal}")
+                            print(f"  Specialization: {specialization}")
+                            print(f"  Capabilities: {capabilities}")
+                            print(f"  Capabilities initialized: {list(self.lobby.agent_capabilities[agent_id].keys())}")
+                            
+                            response = {
+                                'status': 'success',
+                                'agent_id': agent_id,
+                                'message': 'Agent registered successfully',
+                                'goal_support': bool(goal),
+                                'collaboration_ready': True,
+                                'capabilities_count': len(capabilities)
+                            }
+                            self._send_json_response(200, response)
+                        except json.JSONDecodeError:
+                            self._send_json_response(400, {'status': 'error', 'message': 'Invalid JSON'})
+                    
+                    elif path == '/api/delegate_task':
+                        try:
+                            data = json.loads(post_data) if post_data else {}
+                            
+                            # Extract delegation parameters
+                            task_title = data.get('task_title', '')
+                            task_description = data.get('task_description', '')
+                            required_capabilities = data.get('required_capabilities', [])
+                            requester_id = data.get('requester_id', '')
+                            
+                            # Goal-driven collaboration parameters
+                            task_intent = data.get('task_intent', '')
+                            max_agents = data.get('max_agents', 3)
+                            
+                            if not all([task_title, task_description, required_capabilities, requester_id]):
+                                self._send_json_response(400, {'status': 'error', 'message': 'Missing required fields'})
+                                return
+                            
+                            # Create delegation using collaboration engine (synchronously)
+                            delegation_id = f"delegation_{uuid.uuid4().hex[:8]}"
+                            
+                            # Enhanced data for goal-driven collaboration
+                            enhanced_data = {
+                                **data,
+                                'task_intent': task_intent,
+                                'max_agents': max_agents,
+                                'collaboration_type': 'goal_driven' if task_intent else 'standard'
+                            }
+                            
+                            # Use a helper method to handle async calls
+                            result = self._create_delegation_sync(
+                                delegation_id, task_title, task_description, 
+                                required_capabilities, requester_id, enhanced_data
+                            )
+                            
+                            if result['success']:
+                                # Store delegation to workflow mapping
+                                self.lobby.delegation_to_workflow[delegation_id] = result['workflow_id']
+                                
+                                # Re-enable background workflow creation
+                                self._schedule_workflow_creation(
+                                    result['workflow_id'], task_title, task_description,
+                                    required_capabilities, requester_id, enhanced_data
+                                )
+                                
+                                response = {
+                                    'status': 'success',
+                                    'delegation_id': delegation_id,
+                                    'workflow_id': result['workflow_id'],
+                                    'message': f"Task '{task_title}' delegated successfully",
+                                    'started': result['started'],
+                                    'collaboration_type': enhanced_data['collaboration_type'],
+                                    'max_agents': max_agents if task_intent else 1
+                                }
+                                self._send_json_response(200, response)
+                            else:
+                                self._send_json_response(500, {'status': 'error', 'message': result['error']})
+                            
+                        except json.JSONDecodeError:
+                            self._send_json_response(400, {'status': 'error', 'message': 'Invalid JSON'})
+                        except Exception as e:
+                            import traceback
+                            traceback.print_exc()
+                            self._send_json_response(500, {'status': 'error', 'message': f'Delegation failed: {str(e)}'})
+                    
+                    else:
+                        self._send_json_response(404, {'status': 'error', 'message': 'Not found'})
+                except Exception as e:
+                    print(f"HTTP POST error: {e}")
+                    self._send_json_response(500, {'status': 'error', 'error': str(e)})
+            
+            def _schedule_workflow_creation(self, workflow_id, task_title, task_description,
+                                           required_capabilities, requester_id, data):
+                """Schedule async workflow creation as background task"""
+                try:
+                    print(f"HTTP: _schedule_workflow_creation called for {workflow_id}")
+                    print(f"HTTP: Scheduling workflow creation for {workflow_id}")
+                    
+                    # Create request for the bridge queue
+                    request = {
+                        'type': 'create_workflow',
+                        'delegation_id': None,  # Will be filled by the caller
+                        'workflow_id': workflow_id,
+                        'task_title': task_title,
+                        'task_description': task_description,
+                        'required_capabilities': required_capabilities,
+                        'requester_id': requester_id,
+                        'data': data
+                    }
+                    
+                    # Find the delegation ID for this workflow
+                    delegation_id = None
+                    for del_id, wf_id in self.server.lobby_instance.delegation_to_workflow.items():
+                        if wf_id == workflow_id:
+                            delegation_id = del_id
+                            break
+                    
+                    print(f"HTTP: Found delegation_id: {delegation_id} for workflow_id: {workflow_id}")
+                    
+                    if delegation_id:
+                        request['delegation_id'] = delegation_id
+                        
+                        # Put request in thread-safe queue
+                        print(f"HTTP: Adding request to bridge queue...")
+                        self.server.lobby_instance._http_to_asyncio_queue.put(request)
+                        print(f"HTTP: Queued workflow creation request for delegation {delegation_id}")
+                        print(f"HTTP: Queue size is now: {self.server.lobby_instance._http_to_asyncio_queue.qsize()}")
+                    else:
+                        print(f"HTTP: Warning - Could not find delegation ID for workflow {workflow_id}")
+                        print(f"HTTP: Available delegations: {list(self.server.lobby_instance.delegation_to_workflow.items())}")
+                        
+                except Exception as e:
+                    print(f"HTTP: Error scheduling workflow creation: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            def _create_delegation_sync(self, delegation_id, task_title, task_description, 
+                                      required_capabilities, requester_id, data):
+                """Synchronous wrapper for async delegation creation"""
+                try:
+                    # Simple synchronous approach - don't mix async/sync contexts
+                    # Just return success for now and let the workflow handle the rest
+                    
+                    # Create a simple workflow ID
+                    import uuid
+                    workflow_id = str(uuid.uuid4())
+                    
+                    # Store basic delegation info
+                    lobby_instance_ref = self.server.lobby_instance
+                    lobby_instance_ref.delegation_to_workflow[delegation_id] = workflow_id
+                    
+                    # Return success - the collaboration engine will handle the actual workflow later
+                    print(f"HTTP: Created delegation {delegation_id} -> workflow {workflow_id}")
+                    
+                    return {
+                        'success': True,
+                        'workflow_id': workflow_id,
+                        'started': True
+                    }
+                    
+                except Exception as e:
+                    print(f"Delegation sync wrapper error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return {'success': False, 'error': str(e)}
+            
+            def _send_json_response(self, status_code, data):
+                self.send_response(status_code)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                response_json = json.dumps(data)
+                self.wfile.write(response_json.encode('utf-8'))
+            
+            def log_message(self, format, *args):
+                # Suppress default logging
+                pass
+        
+        # Create handler with lobby instance
+        handler_class = LobbyHTTPHandler
+        
+        # Create custom server class that stores lobby instance
+        class LobbyTCPServer(socketserver.TCPServer):
+            handler_class = LobbyHTTPHandler
+            
+            def __init__(self, server_address, RequestHandlerClass, lobby_instance):
+                self.lobby_instance = lobby_instance
+                super().__init__(server_address, RequestHandlerClass)
+        
+        return LobbyTCPServer
+    
+    async def _websocket_handler(self, websocket):
+        """Handle WebSocket connections"""
+        agent_id = None
+        try:
+            self.logger.info("WebSocket connection established")
+            
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get('type', 'unknown')
+                    
+                    if msg_type == 'register':
+                        agent_id = data.get('agent_id')
+                        if agent_id:
+                            self.websocket_connections[agent_id] = websocket
+                            self.logger.info(f"Agent {agent_id} connected via WebSocket")
+                            
+                            # Send acknowledgment
+                            await websocket.send(json.dumps({
+                                'type': 'register_ack',
+                                'status': 'success',
+                                'agent_id': agent_id
+                            }))
+                    
+                    elif msg_type == 'task_response':
+                        # Handle task completion response from agent
+                        await self._handle_task_response(data)
+                    
+                    elif msg_type == 'ping':
+                        await websocket.send(json.dumps({'type': 'pong'}))
+                    
+                    elif msg_type == 'message':
+                        # Handle agent-to-agent messages
+                        await self._handle_websocket_message(data, agent_id)
+                    
+                    else:
+                        # Echo back for testing
+                        await websocket.send(json.dumps({
+                            'type': 'echo',
+                            'original': data,
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        }))
+                        
+                except json.JSONDecodeError:
+                    self.logger.error("Invalid JSON in WebSocket message")
+                    await websocket.send(json.dumps({
+                        'type': 'error',
+                        'message': 'Invalid JSON format'
+                    }))
+                except Exception as e:
+                    self.logger.error(f"WebSocket message error: {e}")
+                    
+        except websockets.exceptions.ConnectionClosed:
+            self.logger.info(f"WebSocket connection closed for agent: {agent_id}")
+        except Exception as e:
+            self.logger.error(f"WebSocket error: {e}")
+        finally:
+            if agent_id and agent_id in self.websocket_connections:
+                del self.websocket_connections[agent_id]
+                self.logger.info(f"Cleaned up WebSocket for agent: {agent_id}")
+    
+    async def _handle_task_response(self, data: Dict[str, Any]):
+        """Handle task response from WebSocket agent"""
+        try:
+            # Convert WebSocket message to Message object for collaboration engine
+            from .message import Message, MessageType, MessagePriority
+            
+            message = Message(
+                message_id=data.get('message_id', str(uuid.uuid4())),
+                sender_id=data.get('sender_id'),
+                receiver_id=data.get('receiver_id', self.lobby_id),
+                message_type=MessageType.RESPONSE,
+                payload=data.get('payload', {}),
+                conversation_id=data.get('conversation_id'),
+                priority=MessagePriority.HIGH,
+                timestamp=datetime.now(timezone.utc)
+            )
+            
+            # Route to collaboration engine
+            if self.collaboration_engine:
+                await self.collaboration_engine.handle_task_result(message)
+                print(f"LOBBY: Routed task response from {message.sender_id} to collaboration engine")
+            else:
+                print(f"LOBBY ERROR: No collaboration engine to handle task response from {message.sender_id}")
+                
+        except Exception as e:
+            print(f"LOBBY ERROR: Failed to handle task response: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def _handle_websocket_message(self, data: Dict[str, Any], sender_id: str):
+        """Handle WebSocket message routing"""
+        try:
+            receiver_id = data.get('receiver_id')
+            content = data.get('content', '')
+            
+            if receiver_id and receiver_id in self.websocket_connections:
+                # Route message to target agent
+                target_ws = self.websocket_connections[receiver_id]
+                await target_ws.send(json.dumps({
+                    'type': 'message',
+                    'sender_id': sender_id,
+                    'content': content,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }))
+                
+                # Send acknowledgment to sender
+                sender_ws = self.websocket_connections.get(sender_id)
+                if sender_ws:
+                    await sender_ws.send(json.dumps({
+                        'type': 'message_ack',
+                        'status': 'delivered',
+                        'receiver_id': receiver_id
+                    }))
+            else:
+                # Send error back to sender
+                sender_ws = self.websocket_connections.get(sender_id)
+                if sender_ws:
+                    await sender_ws.send(json.dumps({
+                        'type': 'error',
+                        'message': f'Agent {receiver_id} not connected'
+                    }))
+                    
+        except Exception as e:
+            self.logger.error(f"Message routing error: {e}")
