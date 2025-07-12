@@ -37,6 +37,7 @@ class MessageType(Enum):
     HEALTH_CHECK = auto()     # New: For agent health monitoring
     CAPABILITY_UPDATE = auto() # New: For dynamic capability updates
     TASK_OUTCOME_REPORT = auto() # New: For agents to report task success/failure to Lobby for reputation
+    TASK_ASSIGNMENT = auto() # For task assignment to agents
     # Potential new types for SDK/Lobby interaction if needed for pub/sub, etc.
     # SUBSCRIBE_TOPIC = auto()
     # UNSUBSCRIBE_TOPIC = auto()
@@ -221,7 +222,7 @@ class InteractionManager:
 
 
 class EcosystemClient:
-    """SDK Client for agents to connect and interact with the Agent Lobby Ecosystem."""
+    """SDK Client for agents to connect and interact with the Agent Lobbi Ecosystem."""
     def __init__(
         self,
         agent_id: str,

@@ -1,5 +1,5 @@
 """
-Production Load Balancer for Agent Lobby
+Production Load Balancer for Agent Lobbi
 Implements multiple load balancing strategies with health checks
 """
 import asyncio

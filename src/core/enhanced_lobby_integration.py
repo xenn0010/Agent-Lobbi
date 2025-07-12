@@ -2,7 +2,7 @@
 """
 ENHANCED LOBBY INTEGRATION WITH DATA BUS + TRAFFIC LIGHTS
 ========================================================
-This module integrates the new orchestration system with existing Agent Lobby.
+This module integrates the new orchestration system with existing Agent Lobbi.
 
 Key Features:
 1. Backward compatibility with existing APIs
@@ -26,7 +26,7 @@ from .data_bus_orchestrator import (
 logger = logging.getLogger(__name__)
 
 class EnhancedAgentLobby:
-    """Enhanced Agent Lobby with Data Bus + Traffic Light orchestration"""
+    """Enhanced Agent Lobbi with Data Bus + Traffic Light orchestration"""
     
     def __init__(self, original_lobby):
         self.original_lobby = original_lobby
@@ -34,7 +34,7 @@ class EnhancedAgentLobby:
         self.agent_capabilities: Dict[str, List[str]] = {}
         self.workflow_patterns: Dict[str, Any] = {}
         
-        logger.info("🎯 Enhanced Agent Lobby initialized")
+        logger.info(" Enhanced Agent Lobbi initialized")
         logger.info("   Data Bus + Traffic Light orchestration enabled")
         
     async def initialize(self):
@@ -48,7 +48,7 @@ class EnhancedAgentLobby:
         # Integrate with original lobby message handling
         await self._integrate_message_handling()
         
-        logger.info("🎯 Enhanced Agent Lobby fully operational")
+        logger.info(" Enhanced Agent Lobbi fully operational")
         
     async def _discover_agent_capabilities(self):
         """Discover capabilities of registered agents"""
@@ -73,7 +73,7 @@ class EnhancedAgentLobby:
                     capability_pools[capability] = []
                 capability_pools[capability].append(agent_id)
                 
-        logger.info(f"🔍 Discovered {len(self.agent_capabilities)} agents")
+        logger.info(f" Discovered {len(self.agent_capabilities)} agents")
         for capability, agents in capability_pools.items():
             logger.info(f"   {capability}: {len(agents)} agents")
             
@@ -133,7 +133,7 @@ class EnhancedAgentLobby:
         # Replace with enhanced handler
         self.original_lobby._process_single_message = self._enhanced_message_handler
         
-        logger.info("🔌 Message handling integration complete")
+        logger.info("CONNECT Message handling integration complete")
     
     async def _enhanced_message_handler(self, message):
         """Enhanced message handler that supports both old and new systems"""
@@ -154,7 +154,7 @@ class EnhancedAgentLobby:
             
             handled = await self.orchestrator.handle_agent_response(task_id, response, workflow_id)
             if handled:
-                logger.info(f"🎛️ Orchestrator handled response for task {task_id}")
+                logger.info(f" Orchestrator handled response for task {task_id}")
                 return
         
         # Fall back to original message handling
@@ -183,7 +183,7 @@ class EnhancedAgentLobby:
             requester_id=requester_id
         )
         
-        logger.info(f"🎯 Created orchestrated workflow: {workflow_id}")
+        logger.info(f" Created orchestrated workflow: {workflow_id}")
         logger.info(f"   Type: {workflow_type}")
         logger.info(f"   Goal: {goal}")
         
@@ -242,7 +242,7 @@ class EnhancedAgentLobby:
         This replaces the broken original method with working orchestration
         """
         
-        logger.info(f"🔄 Converting legacy workflow request to orchestrated workflow")
+        logger.info(f" Converting legacy workflow request to orchestrated workflow")
         logger.info(f"   Goal: {goal}")
         logger.info(f"   Required capabilities: {required_capabilities}")
         
@@ -271,7 +271,7 @@ class EnhancedAgentLobby:
             requester_id=requester_id
         )
         
-        logger.info(f"✅ Legacy workflow converted to orchestrated workflow: {workflow_id}")
+        logger.info(f" Legacy workflow converted to orchestrated workflow: {workflow_id}")
         return workflow_id
     
     def _select_best_pattern(self, required_capabilities: List[str]) -> Optional[str]:
@@ -280,7 +280,7 @@ class EnhancedAgentLobby:
         for pattern_name, pattern in self.workflow_patterns.items():
             pattern_capabilities = pattern["stages"]
             if set(required_capabilities).issubset(set(pattern_capabilities)):
-                logger.info(f"🎯 Selected pattern '{pattern_name}' for capabilities {required_capabilities}")
+                logger.info(f" Selected pattern '{pattern_name}' for capabilities {required_capabilities}")
                 return pattern_name
         
         # Check for partial matches
@@ -296,7 +296,7 @@ class EnhancedAgentLobby:
                 best_match = pattern_name
         
         if best_match and best_score > 0:
-            logger.info(f"🎯 Selected partial match pattern '{best_match}' (score: {best_score}/{len(required_capabilities)})")
+            logger.info(f" Selected partial match pattern '{best_match}' (score: {best_score}/{len(required_capabilities)})")
             
         return best_match
     
@@ -358,11 +358,11 @@ async def enhance_existing_lobby(lobby):
     enhanced = EnhancedAgentLobby(lobby)
     await enhanced.initialize()
     
-    logger.info("🎯 Lobby enhancement complete")
-    logger.info("   ✅ Data Bus orchestration enabled")
-    logger.info("   ✅ Traffic Light stage management enabled")
-    logger.info("   ✅ Multi-agent collaboration fixed")
-    logger.info("   ✅ Backward compatibility maintained")
+    logger.info(" Lobby enhancement complete")
+    logger.info("    Data Bus orchestration enabled")
+    logger.info("    Traffic Light stage management enabled")
+    logger.info("    Multi-agent collaboration fixed")
+    logger.info("    Backward compatibility maintained")
     
     return enhanced
 

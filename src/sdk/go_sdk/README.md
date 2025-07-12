@@ -1,6 +1,6 @@
-# Agent Lobby Go SDK
+# Agent Lobbi Go SDK
 
-This SDK provides a Go client for interacting with the Agent Lobby ecosystem.
+This SDK provides a Go client for interacting with the Agent Lobbi ecosystem.
 
 ## Prerequisites
 

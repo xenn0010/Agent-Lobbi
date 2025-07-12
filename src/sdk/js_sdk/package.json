@@ -1,7 +1,7 @@
 {
   "name": "@agent-lobby/sdk",
   "version": "0.1.0",
-  "description": "JavaScript SDK for interacting with the Agent Lobby ecosystem.",
+  "description": "JavaScript SDK for interacting with the Agent Lobbi ecosystem.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified yet\" && exit 1",

@@ -1,722 +1,668 @@
+#!/usr/bin/env python3
 """
-Security and authentication system for the agent ecosystem.
-Provides JWT authentication, role-based access control, rate limiting, and security monitoring.
+Enterprise Security Module for Agent Lobbi
+Implements authentication, rate limiting, encryption, audit logging, and CORS
 """
 
 import asyncio
 import hashlib
 import hmac
-import secrets
+try:
+    import jwt
+except ImportError:
+    # Fallback - disable JWT functionality
+    jwt = None
 import time
-from typing import Dict, List, Optional, Any, Set, Callable
+import json
+import ssl
+from typing import Dict, List, Any, Optional, Callable, Tuple
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
-import json
-import logging
-
-# JWT and cryptography
-import jwt
+import secrets
+import bcrypt
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import bcrypt
-import base64
+from collections import defaultdict, deque
+import structlog
+import re
+import ipaddress
+from urllib.parse import urlparse
+import os
 
-# Pydantic for data validation
-from pydantic import BaseModel, Field, validator
-from typing import Optional
+# Try to import monitoring - graceful degradation if not available
+try:
+    from .monitoring import get_metrics
+    MONITORING_AVAILABLE = True
+except ImportError:
+    MONITORING_AVAILABLE = False
 
+logger = structlog.get_logger(__name__)
 
-class Permission(Enum):
-    """System permissions"""
-    # Agent permissions
-    REGISTER_AGENT = "register_agent"
-    SEND_MESSAGE = "send_message"
-    RECEIVE_MESSAGE = "receive_message"
-    INITIATE_INTERACTION = "initiate_interaction"
-    RESPOND_TO_INTERACTION = "respond_to_interaction"
-    
-    # Lobby permissions
-    MANAGE_AGENTS = "manage_agents"
-    VIEW_SYSTEM_STATUS = "view_system_status"
-    MANAGE_CONVERSATIONS = "manage_conversations"
-    VIEW_METRICS = "view_metrics"
-    
-    # Admin permissions
-    MANAGE_USERS = "manage_users"
-    MANAGE_ROLES = "manage_roles"
-    SYSTEM_ADMIN = "system_admin"
-    VIEW_LOGS = "view_logs"
+class SecurityLevel(Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
 
-
-class Role(Enum):
-    """System roles with associated permissions"""
-    AGENT = "agent"
-    LOBBY = "lobby"
-    ADMIN = "admin"
-    VIEWER = "viewer"
-
-
-# Role-Permission mapping
-ROLE_PERMISSIONS = {
-    Role.AGENT: {
-        Permission.REGISTER_AGENT,
-        Permission.SEND_MESSAGE,
-        Permission.RECEIVE_MESSAGE,
-        Permission.INITIATE_INTERACTION,
-        Permission.RESPOND_TO_INTERACTION
-    },
-    Role.LOBBY: {
-        Permission.MANAGE_AGENTS,
-        Permission.VIEW_SYSTEM_STATUS,
-        Permission.MANAGE_CONVERSATIONS,
-        Permission.SEND_MESSAGE,
-        Permission.RECEIVE_MESSAGE
-    },
-    Role.ADMIN: {
-        Permission.MANAGE_USERS,
-        Permission.MANAGE_ROLES,
-        Permission.SYSTEM_ADMIN,
-        Permission.VIEW_LOGS,
-        Permission.VIEW_METRICS,
-        Permission.MANAGE_AGENTS,
-        Permission.VIEW_SYSTEM_STATUS,
-        Permission.MANAGE_CONVERSATIONS
-    },
-    Role.VIEWER: {
-        Permission.VIEW_SYSTEM_STATUS,
-        Permission.VIEW_METRICS
-    }
-}
-
+class AuthMethod(Enum):
+    API_KEY = "api_key"
+    JWT_TOKEN = "jwt_token"
+    OAUTH2 = "oauth2"
+    MUTUAL_TLS = "mutual_tls"
 
 @dataclass
 class SecurityConfig:
-    """Security configuration settings"""
-    # JWT settings
-    jwt_secret_key: str
+    """Comprehensive security configuration"""
+    # Authentication
+    jwt_secret: str = field(default_factory=lambda: secrets.token_urlsafe(64))
     jwt_algorithm: str = "HS256"
-    jwt_expiration_hours: int = 24
-    jwt_refresh_expiration_days: int = 7
+    jwt_expiry_hours: int = 24
+    api_key_length: int = 32
+    require_auth: bool = True
     
-    # Encryption settings
+    # Rate Limiting
+    rate_limit_enabled: bool = True
+    global_rate_limit: int = 1000  # requests per minute
+    per_agent_rate_limit: int = 100  # requests per minute
+    burst_allowance: int = 50  # burst capacity
+    
+    # Encryption
+    enable_encryption: bool = True
     encryption_key: Optional[bytes] = None
     
-    # Rate limiting
-    rate_limit_requests: int = 100
-    rate_limit_window_seconds: int = 60
+    # TLS/SSL
+    tls_enabled: bool = True
+    cert_file: Optional[str] = None
+    key_file: Optional[str] = None
+    ca_file: Optional[str] = None
     
-    # Password settings
-    password_min_length: int = 8
-    password_require_special: bool = True
-    password_require_numbers: bool = True
-    password_require_uppercase: bool = True
+    # CORS
+    cors_enabled: bool = True
+    cors_origins: List[str] = field(default_factory=lambda: ["*"])
+    cors_methods: List[str] = field(default_factory=lambda: ["GET", "POST", "PUT", "DELETE"])
+    cors_headers: List[str] = field(default_factory=lambda: ["*"])
     
-    # Session settings
-    session_timeout_minutes: int = 30
-    max_concurrent_sessions: int = 5
+    # Security Headers
+    security_headers: Dict[str, str] = field(default_factory=lambda: {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "X-XSS-Protection": "1; mode=block",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+        "Content-Security-Policy": "default-src 'self'",
+        "Referrer-Policy": "strict-origin-when-cross-origin"
+    })
     
-    # Security monitoring
-    max_failed_attempts: int = 5
-    lockout_duration_minutes: int = 15
+    # Audit Logging
+    audit_enabled: bool = True
+    audit_log_file: str = "security_audit.log"
     
-    def __post_init__(self):
-        if self.encryption_key is None:
-            # Generate a new encryption key
-            password = self.jwt_secret_key.encode()
-            salt = b'agent_ecosystem_salt'  # In production, use a random salt
-            kdf = PBKDF2HMAC(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=salt,
-                iterations=100000,
-            )
-            key = base64.urlsafe_b64encode(kdf.derive(password))
-            self.encryption_key = key
+    # Input Validation
+    max_message_size: int = 1024 * 1024  # 1MB
+    max_payload_depth: int = 10
+    blocked_patterns: List[str] = field(default_factory=lambda: [
+        r"<script.*?>.*?</script>",  # XSS
+        r"javascript:",              # XSS
+        r"on\w+\s*=",               # Event handlers
+        r"eval\s*\(",               # Code injection
+        r"exec\s*\(",               # Code injection
+    ])
 
+class SecurityAuditEvent:
+    """Security audit event"""
+    def __init__(self, event_type: str, user_id: str, ip_address: str, 
+                 details: Dict[str, Any], risk_level: SecurityLevel = SecurityLevel.LOW):
+        self.event_type = event_type
+        self.user_id = user_id
+        self.ip_address = ip_address
+        self.details = details
+        self.risk_level = risk_level
+        self.timestamp = datetime.now(timezone.utc)
 
-class User(BaseModel):
-    """User model for authentication"""
-    user_id: str
-    username: str
-    email: Optional[str] = None
-    password_hash: str
-    roles: List[Role] = Field(default_factory=list)
-    is_active: bool = True
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    last_login: Optional[datetime] = None
-    failed_login_attempts: int = 0
-    locked_until: Optional[datetime] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+class RateLimiter:
+    """Token bucket rate limiter with burst support"""
     
-    def has_permission(self, permission: Permission) -> bool:
-        """Check if user has a specific permission"""
-        for role in self.roles:
-            if permission in ROLE_PERMISSIONS.get(role, set()):
-                return True
-        return False
-    
-    def has_role(self, role: Role) -> bool:
-        """Check if user has a specific role"""
-        return role in self.roles
-    
-    def is_locked(self) -> bool:
-        """Check if user account is locked"""
-        if self.locked_until is None:
-            return False
-        return datetime.now(timezone.utc) < self.locked_until
-
-
-class AuthToken(BaseModel):
-    """Authentication token model"""
-    access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
-    expires_in: int
-    user_id: str
-    permissions: List[str]
-
-
-class RateLimitEntry:
-    """Rate limiting entry"""
-    def __init__(self, max_requests: int, window_seconds: int):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-        self.requests: List[float] = []
-    
-    def is_allowed(self) -> bool:
+    def __init__(self, rate_limit: int, burst_capacity: int = None):
+        self.rate_limit = rate_limit  # tokens per minute
+        self.burst_capacity = burst_capacity or rate_limit
+        self.buckets: Dict[str, Dict[str, Any]] = {}
+        
+    def is_allowed(self, identifier: str) -> bool:
         """Check if request is allowed under rate limit"""
         now = time.time()
         
-        # Remove old requests outside the window
-        self.requests = [req_time for req_time in self.requests 
-                        if now - req_time < self.window_seconds]
+        # Initialize bucket if it doesn't exist
+        if identifier not in self.buckets:
+            self.buckets[identifier] = {
+                'tokens': self.burst_capacity,
+                'last_refill': now
+            }
         
-        # Check if under limit
-        if len(self.requests) < self.max_requests:
-            self.requests.append(now)
+        bucket = self.buckets[identifier]
+        
+        # Calculate tokens to add since last refill
+        time_passed = now - bucket['last_refill']
+        tokens_to_add = (time_passed / 60.0) * self.rate_limit
+        
+        # Update bucket
+        bucket['tokens'] = min(
+            self.burst_capacity,
+            bucket['tokens'] + tokens_to_add
+        )
+        bucket['last_refill'] = now
+        
+        # Check if request can be allowed
+        if bucket['tokens'] >= 1:
+            bucket['tokens'] -= 1
             return True
         
         return False
     
-    def time_until_reset(self) -> float:
-        """Get time until rate limit resets"""
-        if not self.requests:
+    def get_wait_time(self, identifier: str) -> float:
+        """Get wait time until next request is allowed"""
+        # Initialize bucket if it doesn't exist
+        if identifier not in self.buckets:
             return 0.0
         
-        oldest_request = min(self.requests)
-        return max(0.0, self.window_seconds - (time.time() - oldest_request))
+        bucket = self.buckets[identifier]
+        if bucket['tokens'] >= 1:
+            return 0.0
+        
+        # Calculate time until next token
+        return (1 - bucket['tokens']) * (60.0 / self.rate_limit)
 
-
-class SecurityEvent(BaseModel):
-    """Security event for monitoring"""
-    event_id: str
-    event_type: str
-    user_id: Optional[str] = None
-    ip_address: Optional[str] = None
-    user_agent: Optional[str] = None
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    details: Dict[str, Any] = Field(default_factory=dict)
-    severity: str = "info"  # info, warning, error, critical
-
-
-class SecurityManager:
-    """Central security manager"""
+class InputValidator:
+    """Advanced input validation and sanitization"""
     
     def __init__(self, config: SecurityConfig):
         self.config = config
-        self.logger = logging.getLogger(__name__)
-        
-        # Initialize encryption
-        self.fernet = Fernet(config.encryption_key)
-        
-        # Rate limiting
-        self.rate_limits: Dict[str, RateLimitEntry] = {}
-        
-        # Active sessions
-        self.active_sessions: Dict[str, Dict[str, Any]] = {}
-        
-        # Security events
-        self.security_events: List[SecurityEvent] = []
-        
-        # User storage (in production, this would be a database)
-        self.users: Dict[str, User] = {}
-        
-        # Initialize default admin user
-        self._create_default_admin()
+        self.blocked_patterns = [re.compile(pattern, re.IGNORECASE) 
+                               for pattern in config.blocked_patterns]
     
-    def _create_default_admin(self):
-        """Create default admin user"""
-        admin_password = "admin123"  # In production, generate a secure password
-        password_hash = self.hash_password(admin_password)
-        
-        admin_user = User(
-            user_id="admin",
-            username="admin",
-            email="admin@agent-ecosystem.local",
-            password_hash=password_hash,
-            roles=[Role.ADMIN]
-        )
-        
-        self.users["admin"] = admin_user
-        self.logger.info("Created default admin user (username: admin, password: admin123)")
-    
-    def hash_password(self, password: str) -> str:
-        """Hash a password using bcrypt"""
-        salt = bcrypt.gensalt()
-        password_hash = bcrypt.hashpw(password.encode('utf-8'), salt)
-        return password_hash.decode('utf-8')
-    
-    def verify_password(self, password: str, password_hash: str) -> bool:
-        """Verify a password against its hash"""
-        return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
-    
-    def validate_password_strength(self, password: str) -> tuple[bool, List[str]]:
-        """Validate password strength"""
-        errors = []
-        
-        if len(password) < self.config.password_min_length:
-            errors.append(f"Password must be at least {self.config.password_min_length} characters long")
-        
-        if self.config.password_require_uppercase and not any(c.isupper() for c in password):
-            errors.append("Password must contain at least one uppercase letter")
-        
-        if self.config.password_require_numbers and not any(c.isdigit() for c in password):
-            errors.append("Password must contain at least one number")
-        
-        if self.config.password_require_special and not any(c in "!@#$%^&*()_+-=[]{}|;:,.<>?" for c in password):
-            errors.append("Password must contain at least one special character")
-        
-        return len(errors) == 0, errors
-    
-    def create_user(self, username: str, password: str, email: Optional[str] = None, 
-                   roles: List[Role] = None) -> tuple[bool, str]:
-        """Create a new user"""
+    def validate_message(self, message: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        """Validate message for security threats"""
         try:
-            # Check if user already exists
-            if any(user.username == username for user in self.users.values()):
-                return False, "Username already exists"
+            # Check message size
+            message_size = len(json.dumps(message))
+            if message_size > self.config.max_message_size:
+                return False, f"Message too large: {message_size} bytes"
             
-            # Validate password
-            is_valid, errors = self.validate_password_strength(password)
-            if not is_valid:
-                return False, "; ".join(errors)
+            # Check payload depth
+            if self._get_dict_depth(message) > self.config.max_payload_depth:
+                return False, "Message payload too deeply nested"
             
-            # Create user
-            user_id = secrets.token_urlsafe(16)
-            password_hash = self.hash_password(password)
+            # Check for malicious patterns
+            message_str = json.dumps(message)
+            for pattern in self.blocked_patterns:
+                if pattern.search(message_str):
+                    return False, f"Malicious pattern detected: {pattern.pattern}"
             
-            user = User(
-                user_id=user_id,
-                username=username,
-                email=email,
-                password_hash=password_hash,
-                roles=roles or [Role.AGENT]
-            )
+            # Validate required fields
+            required_fields = ['sender_id', 'receiver_id', 'message_type']
+            for field in required_fields:
+                if field not in message:
+                    return False, f"Missing required field: {field}"
+                if not isinstance(message[field], str) or not message[field].strip():
+                    return False, f"Invalid {field}: must be non-empty string"
             
-            self.users[user_id] = user
+            # Validate sender_id format (alphanumeric + underscore + dash)
+            if not re.match(r'^[a-zA-Z0-9_-]+$', message['sender_id']):
+                return False, "Invalid sender_id format"
             
-            # Log security event
-            self.log_security_event(
-                event_type="user_created",
-                user_id=user_id,
-                details={"username": username, "roles": [r.value for r in user.roles]}
-            )
+            # Validate message_type
+            valid_types = [
+                'REGISTER', 'REQUEST', 'RESPONSE', 'ACTION', 'INFO', 
+                'ERROR', 'DISCOVER_SERVICES', 'BROADCAST', 'ACK'
+            ]
+            if message['message_type'] not in valid_types:
+                return False, f"Invalid message_type: {message['message_type']}"
             
-            return True, user_id
+            return True, None
             
         except Exception as e:
-            self.logger.error(f"Error creating user: {e}")
-            return False, str(e)
+            return False, f"Validation error: {str(e)}"
     
-    def authenticate_user(self, username: str, password: str, 
-                         ip_address: Optional[str] = None) -> tuple[bool, Optional[User], str]:
-        """Authenticate a user"""
+    def sanitize_string(self, text: str) -> str:
+        """Sanitize string input"""
+        if not text:
+            return ""
+        
+        # Remove null bytes
+        text = text.replace('\x00', '')
+        
+        # Limit length
+        text = text[:1000]
+        
+        # Remove potentially dangerous characters
+        dangerous_chars = ['<', '>', '"', "'", '&', '\n', '\r', '\t']
+        for char in dangerous_chars:
+            text = text.replace(char, '')
+        
+        return text.strip()
+    
+    def _get_dict_depth(self, obj: Any, depth: int = 0) -> int:
+        """Calculate maximum depth of nested dictionaries"""
+        if not isinstance(obj, dict):
+            return depth
+        
+        if not obj:
+            return depth + 1
+        
+        return max(self._get_dict_depth(value, depth + 1) for value in obj.values())
+
+class EncryptionManager:
+    """Enterprise-grade encryption for all sensitive data"""
+
+    KEY_FILE = "encryption.key"
+    
+    def __init__(self, config: SecurityConfig):
+        """Initialize encryption with a secure key from env var or file."""
+        self.config = config
+        self.fernet = None
+        
+        if config.enable_encryption:
+            self.key = self._load_or_generate_key(config.encryption_key)
+            self.fernet = Fernet(self.key)
+
+    def _load_or_generate_key(self, config_key: Optional[bytes]) -> bytes:
+        """Loads key from env var, config, file, or generates a new one."""
+        # 1. From environment variable (highest priority)
+        env_key = os.environ.get("ENCRYPTION_KEY")
+        if env_key:
+            logger.info("Loading encryption key from environment variable.")
+            return env_key.encode()
+
+        # 2. From security config
+        if config_key:
+            logger.info("Loading encryption key from security config.")
+            return config_key
+
+        # 3. From key file
+        if os.path.exists(self.KEY_FILE):
+            logger.info(f"Loading encryption key from file: {self.KEY_FILE}")
+            with open(self.KEY_FILE, "rb") as f:
+                return f.read()
+
+        # 4. Generate, save, and return a new key
+        logger.warning(
+            f"No persistent key found. Generating new key and saving to {self.KEY_FILE}"
+        )
+        logger.warning(
+            "IMPORTANT: For production, set the ENCRYPTION_KEY environment variable for better security."
+        )
+        new_key = Fernet.generate_key()
         try:
-            # Find user by username
-            user = None
-            for u in self.users.values():
-                if u.username == username:
-                    user = u
-                    break
-            
-            if not user:
-                self.log_security_event(
-                    event_type="login_failed",
-                    details={"username": username, "reason": "user_not_found"},
-                    ip_address=ip_address,
-                    severity="warning"
-                )
-                return False, None, "Invalid username or password"
-            
-            # Check if user is locked
-            if user.is_locked():
-                self.log_security_event(
-                    event_type="login_failed",
-                    user_id=user.user_id,
-                    details={"username": username, "reason": "account_locked"},
-                    ip_address=ip_address,
-                    severity="warning"
-                )
-                return False, None, "Account is locked due to too many failed attempts"
-            
-            # Check if user is active
-            if not user.is_active:
-                self.log_security_event(
-                    event_type="login_failed",
-                    user_id=user.user_id,
-                    details={"username": username, "reason": "account_inactive"},
-                    ip_address=ip_address,
-                    severity="warning"
-                )
-                return False, None, "Account is inactive"
-            
-            # Verify password
-            if not self.verify_password(password, user.password_hash):
-                # Increment failed attempts
-                user.failed_login_attempts += 1
-                
-                # Lock account if too many failures
-                if user.failed_login_attempts >= self.config.max_failed_attempts:
-                    user.locked_until = datetime.now(timezone.utc) + timedelta(
-                        minutes=self.config.lockout_duration_minutes
-                    )
-                
-                self.log_security_event(
-                    event_type="login_failed",
-                    user_id=user.user_id,
-                    details={
-                        "username": username, 
-                        "reason": "invalid_password",
-                        "failed_attempts": user.failed_login_attempts
-                    },
-                    ip_address=ip_address,
-                    severity="warning"
-                )
-                
-                return False, None, "Invalid username or password"
-            
-            # Successful authentication
-            user.failed_login_attempts = 0
-            user.locked_until = None
-            user.last_login = datetime.now(timezone.utc)
-            
-            self.log_security_event(
-                event_type="login_success",
-                user_id=user.user_id,
-                details={"username": username},
-                ip_address=ip_address
+            with open(self.KEY_FILE, "wb") as f:
+                f.write(new_key)
+            logger.info(f"New key saved successfully to {self.KEY_FILE}")
+        except IOError as e:
+            logger.error(
+                f"Failed to save new encryption key to {self.KEY_FILE}", error=str(e)
             )
-            
-            return True, user, "Authentication successful"
-            
+            logger.error("The key will be ephemeral for this session only.")
+
+        return new_key
+    
+    def encrypt_message(self, message: str) -> str:
+        """Encrypt message payload"""
+        if not self.fernet:
+            return message
+        
+        try:
+            encrypted = self.fernet.encrypt(message.encode())
+            return encrypted.decode()
         except Exception as e:
-            self.logger.error(f"Error during authentication: {e}")
-            return False, None, "Authentication error"
+            logger.error("Encryption failed", error=str(e))
+            return message
     
-    def generate_tokens(self, user: User) -> AuthToken:
-        """Generate JWT access and refresh tokens"""
-        now = datetime.now(timezone.utc)
+    def decrypt_message(self, encrypted_message: str) -> str:
+        """Decrypt message payload"""
+        if not self.fernet:
+            return encrypted_message
         
-        # Access token payload
-        access_payload = {
-            "user_id": user.user_id,
-            "username": user.username,
-            "roles": [role.value for role in user.roles],
-            "permissions": [perm.value for role in user.roles 
-                          for perm in ROLE_PERMISSIONS.get(role, set())],
-            "iat": now,
-            "exp": now + timedelta(hours=self.config.jwt_expiration_hours),
-            "type": "access"
-        }
-        
-        # Refresh token payload
-        refresh_payload = {
-            "user_id": user.user_id,
-            "iat": now,
-            "exp": now + timedelta(days=self.config.jwt_refresh_expiration_days),
-            "type": "refresh"
-        }
-        
-        # Generate tokens
-        access_token = jwt.encode(
-            access_payload, 
-            self.config.jwt_secret_key, 
-            algorithm=self.config.jwt_algorithm
-        )
-        
-        refresh_token = jwt.encode(
-            refresh_payload,
-            self.config.jwt_secret_key,
-            algorithm=self.config.jwt_algorithm
-        )
-        
-        # Create session
-        session_id = secrets.token_urlsafe(32)
-        self.active_sessions[session_id] = {
-            "user_id": user.user_id,
-            "created_at": now,
-            "last_activity": now,
-            "access_token": access_token,
-            "refresh_token": refresh_token
-        }
-        
-        return AuthToken(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            expires_in=self.config.jwt_expiration_hours * 3600,
-            user_id=user.user_id,
-            permissions=[perm.value for role in user.roles 
-                        for perm in ROLE_PERMISSIONS.get(role, set())]
-        )
-    
-    def verify_token(self, token: str) -> tuple[bool, Optional[Dict[str, Any]], str]:
-        """Verify and decode a JWT token"""
         try:
-            payload = jwt.decode(
-                token,
-                self.config.jwt_secret_key,
-                algorithms=[self.config.jwt_algorithm]
-            )
-            
-            # Check token type
-            if payload.get("type") != "access":
-                return False, None, "Invalid token type"
-            
-            # Check if user still exists and is active
-            user_id = payload.get("user_id")
-            user = self.users.get(user_id)
-            
-            if not user or not user.is_active:
-                return False, None, "User not found or inactive"
-            
-            return True, payload, "Token valid"
-            
+            decrypted = self.fernet.decrypt(encrypted_message.encode())
+            return decrypted.decode()
+        except Exception as e:
+            logger.error("Decryption failed", error=str(e))
+            return encrypted_message
+
+class AuthenticationManager:
+    """Multi-method authentication system"""
+    
+    def __init__(self, config: SecurityConfig):
+        self.config = config
+        self.api_keys: Dict[str, Dict[str, Any]] = {}
+        self.jwt_secret = config.jwt_secret
+        self.failed_attempts: Dict[str, List[datetime]] = defaultdict(list)
+        self.blocked_ips: Dict[str, datetime] = {}
+        
+    def generate_api_key(self, agent_id: str, permissions: List[str] = None) -> str:
+        """Generate new API key for agent"""
+        api_key = secrets.token_urlsafe(self.config.api_key_length)
+        
+        self.api_keys[api_key] = {
+            'agent_id': agent_id,
+            'permissions': permissions or ['read', 'write'],
+            'created_at': datetime.now(timezone.utc),
+            'last_used': None,
+            'active': True
+        }
+        
+        logger.info("Generated API key", agent_id=agent_id)
+        return api_key
+    
+    def generate_jwt_token(self, agent_id: str, permissions: List[str] = None) -> str:
+        """Generate JWT token for agent"""
+        if jwt is None:
+            # JWT not available - return API key instead
+            return self.generate_api_key(agent_id, permissions)
+        
+        payload = {
+            'agent_id': agent_id,
+            'permissions': permissions or ['read', 'write'],
+            'iat': datetime.now(timezone.utc),
+            'exp': datetime.now(timezone.utc) + timedelta(hours=self.config.jwt_expiry_hours)
+        }
+        
+        token = jwt.encode(payload, self.jwt_secret, algorithm=self.config.jwt_algorithm)
+        logger.info("Generated JWT token", agent_id=agent_id)
+        return token
+    
+    def validate_api_key(self, api_key: str, ip_address: str) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """Validate API key"""
+        if self._is_ip_blocked(ip_address):
+            return False, "IP address blocked", None
+        
+        if api_key not in self.api_keys:
+            self._record_failed_attempt(ip_address)
+            return False, "Invalid API key", None
+        
+        key_data = self.api_keys[api_key]
+        if not key_data['active']:
+            return False, "API key disabled", None
+        
+        # Update last used
+        key_data['last_used'] = datetime.now(timezone.utc)
+        
+        return True, None, key_data
+    
+    def validate_jwt_token(self, token: str, ip_address: str) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """Validate JWT token"""
+        if jwt is None:
+            # JWT not available - try as API key instead
+            return self.validate_api_key(token, ip_address)
+        
+        if self._is_ip_blocked(ip_address):
+            return False, "IP address blocked", None
+        
+        try:
+            payload = jwt.decode(token, self.jwt_secret, algorithms=[self.config.jwt_algorithm])
+            return True, None, payload
         except jwt.ExpiredSignatureError:
-            return False, None, "Token has expired"
-        except jwt.InvalidTokenError as e:
-            return False, None, f"Invalid token: {str(e)}"
-        except Exception as e:
-            self.logger.error(f"Error verifying token: {e}")
-            return False, None, "Token verification error"
+            self._record_failed_attempt(ip_address)
+            return False, "Token expired", None
+        except jwt.InvalidTokenError:
+            self._record_failed_attempt(ip_address)
+            return False, "Invalid token", None
     
-    def refresh_token(self, refresh_token: str) -> tuple[bool, Optional[AuthToken], str]:
-        """Refresh an access token using a refresh token"""
-        try:
-            payload = jwt.decode(
-                refresh_token,
-                self.config.jwt_secret_key,
-                algorithms=[self.config.jwt_algorithm]
-            )
-            
-            # Check token type
-            if payload.get("type") != "refresh":
-                return False, None, "Invalid token type"
-            
-            # Get user
-            user_id = payload.get("user_id")
-            user = self.users.get(user_id)
-            
-            if not user or not user.is_active:
-                return False, None, "User not found or inactive"
-            
-            # Generate new tokens
-            new_tokens = self.generate_tokens(user)
-            
-            self.log_security_event(
-                event_type="token_refreshed",
-                user_id=user_id
-            )
-            
-            return True, new_tokens, "Token refreshed successfully"
-            
-        except jwt.ExpiredSignatureError:
-            return False, None, "Refresh token has expired"
-        except jwt.InvalidTokenError as e:
-            return False, None, f"Invalid refresh token: {str(e)}"
-        except Exception as e:
-            self.logger.error(f"Error refreshing token: {e}")
-            return False, None, "Token refresh error"
-    
-    def check_rate_limit(self, identifier: str) -> tuple[bool, float]:
-        """Check rate limit for an identifier (IP, user, etc.)"""
-        if identifier not in self.rate_limits:
-            self.rate_limits[identifier] = RateLimitEntry(
-                self.config.rate_limit_requests,
-                self.config.rate_limit_window_seconds
-            )
-        
-        rate_limit = self.rate_limits[identifier]
-        is_allowed = rate_limit.is_allowed()
-        time_until_reset = rate_limit.time_until_reset()
-        
-        if not is_allowed:
-            self.log_security_event(
-                event_type="rate_limit_exceeded",
-                details={"identifier": identifier},
-                severity="warning"
-            )
-        
-        return is_allowed, time_until_reset
-    
-    def encrypt_data(self, data: str) -> str:
-        """Encrypt sensitive data"""
-        return self.fernet.encrypt(data.encode()).decode()
-    
-    def decrypt_data(self, encrypted_data: str) -> str:
-        """Decrypt sensitive data"""
-        return self.fernet.decrypt(encrypted_data.encode()).decode()
-    
-    def log_security_event(self, event_type: str, user_id: Optional[str] = None,
-                          ip_address: Optional[str] = None, user_agent: Optional[str] = None,
-                          details: Dict[str, Any] = None, severity: str = "info"):
-        """Log a security event"""
-        event = SecurityEvent(
-            event_id=secrets.token_urlsafe(16),
-            event_type=event_type,
-            user_id=user_id,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            details=details or {},
-            severity=severity
-        )
-        
-        self.security_events.append(event)
-        
-        # Log to system logger
-        log_level = {
-            "info": logging.INFO,
-            "warning": logging.WARNING,
-            "error": logging.ERROR,
-            "critical": logging.CRITICAL
-        }.get(severity, logging.INFO)
-        
-        self.logger.log(
-            log_level,
-            f"Security event: {event_type}",
-            extra={
-                "event_id": event.event_id,
-                "user_id": user_id,
-                "ip_address": ip_address,
-                "details": details
-            }
-        )
-        
-        # Keep only recent events (last 1000)
-        if len(self.security_events) > 1000:
-            self.security_events = self.security_events[-1000:]
-    
-    def get_security_events(self, limit: int = 100, 
-                           event_type: Optional[str] = None,
-                           user_id: Optional[str] = None,
-                           severity: Optional[str] = None) -> List[SecurityEvent]:
-        """Get security events with optional filtering"""
-        events = self.security_events
-        
-        # Apply filters
-        if event_type:
-            events = [e for e in events if e.event_type == event_type]
-        
-        if user_id:
-            events = [e for e in events if e.user_id == user_id]
-        
-        if severity:
-            events = [e for e in events if e.severity == severity]
-        
-        # Sort by timestamp (newest first) and limit
-        events.sort(key=lambda e: e.timestamp, reverse=True)
-        return events[:limit]
-    
-    def cleanup_expired_sessions(self):
-        """Clean up expired sessions"""
+    def _record_failed_attempt(self, ip_address: str):
+        """Record failed authentication attempt"""
         now = datetime.now(timezone.utc)
-        timeout = timedelta(minutes=self.config.session_timeout_minutes)
+        self.failed_attempts[ip_address].append(now)
         
-        expired_sessions = []
-        for session_id, session in self.active_sessions.items():
-            if now - session["last_activity"] > timeout:
-                expired_sessions.append(session_id)
+        # Clean old attempts (older than 1 hour)
+        self.failed_attempts[ip_address] = [
+            attempt for attempt in self.failed_attempts[ip_address]
+            if now - attempt < timedelta(hours=1)
+        ]
         
-        for session_id in expired_sessions:
-            del self.active_sessions[session_id]
-        
-        if expired_sessions:
-            self.log_security_event(
-                event_type="sessions_cleaned",
-                details={"expired_count": len(expired_sessions)}
-            )
+        # Block IP if too many failures
+        if len(self.failed_attempts[ip_address]) >= 5:
+            self.blocked_ips[ip_address] = now + timedelta(hours=1)
+            logger.warning("IP blocked due to failed attempts", ip=ip_address)
     
-    def revoke_user_sessions(self, user_id: str):
-        """Revoke all sessions for a user"""
-        revoked_sessions = []
-        for session_id, session in list(self.active_sessions.items()):
-            if session["user_id"] == user_id:
-                del self.active_sessions[session_id]
-                revoked_sessions.append(session_id)
+    def _is_ip_blocked(self, ip_address: str) -> bool:
+        """Check if IP is blocked"""
+        if ip_address in self.blocked_ips:
+            if datetime.now(timezone.utc) > self.blocked_ips[ip_address]:
+                del self.blocked_ips[ip_address]
+                return False
+            return True
+        return False
+
+class SecurityAuditLogger:
+    """Comprehensive security audit logging"""
+    
+    def __init__(self, config: SecurityConfig):
+        self.config = config
+        self.audit_events: deque = deque(maxlen=10000)
+        self.log_file = None
         
-        if revoked_sessions:
-            self.log_security_event(
-                event_type="user_sessions_revoked",
-                user_id=user_id,
-                details={"revoked_count": len(revoked_sessions)}
-            )
+        if config.audit_enabled:
+            try:
+                self.log_file = open(config.audit_log_file, 'a', encoding='utf-8')
+            except Exception as e:
+                logger.error("Failed to open audit log file", error=str(e))
+    
+    def log_event(self, event: SecurityAuditEvent):
+        """Log security audit event"""
+        self.audit_events.append(event)
+        
+        if self.log_file:
+            try:
+                audit_entry = {
+                    'timestamp': event.timestamp.isoformat(),
+                    'event_type': event.event_type,
+                    'user_id': event.user_id,
+                    'ip_address': event.ip_address,
+                    'risk_level': event.risk_level.value,
+                    'details': event.details
+                }
+                
+                self.log_file.write(json.dumps(audit_entry) + '\n')
+                self.log_file.flush()
+                
+                # Log high-risk events to main logger
+                if event.risk_level in [SecurityLevel.HIGH, SecurityLevel.CRITICAL]:
+                    logger.warning("High-risk security event", **audit_entry)
+                    
+            except Exception as e:
+                logger.error("Failed to write audit log", error=str(e))
+    
+    def get_recent_events(self, count: int = 100, risk_level: SecurityLevel = None) -> List[SecurityAuditEvent]:
+        """Get recent audit events"""
+        events = list(self.audit_events)
+        
+        if risk_level:
+            events = [e for e in events if e.risk_level == risk_level]
+        
+        return events[-count:]
+    
+    def close(self):
+        """Close audit log file"""
+        if self.log_file:
+            self.log_file.close()
+
+class SecurityManager:
+    """Comprehensive security management system"""
+    
+    def __init__(self, config: SecurityConfig = None):
+        self.config = config or SecurityConfig()
+        self.rate_limiter = RateLimiter(
+            self.config.global_rate_limit,
+            self.config.burst_allowance
+        )
+        self.per_agent_limiters: Dict[str, RateLimiter] = {}
+        self.input_validator = InputValidator(self.config)
+        self.encryption_manager = EncryptionManager(self.config)
+        self.auth_manager = AuthenticationManager(self.config)
+        self.audit_logger = SecurityAuditLogger(self.config)
+        
+        # Initialize metrics if available
+        self.metrics = get_metrics() if MONITORING_AVAILABLE else None
+        
+    def check_rate_limit(self, identifier: str, agent_id: str = None) -> Tuple[bool, float]:
+        """Check rate limits for global and per-agent"""
+        # Check global rate limit
+        if not self.rate_limiter.is_allowed(identifier):
+            wait_time = self.rate_limiter.get_wait_time(identifier)
+            if self.metrics:
+                self.metrics.record_rate_limit_hit("global", "global")
+                self.metrics.record_rate_limit_wait("global", wait_time)
+            return False, wait_time
+        
+        # Check per-agent rate limit
+        if agent_id:
+            if agent_id not in self.per_agent_limiters:
+                self.per_agent_limiters[agent_id] = RateLimiter(
+                    self.config.per_agent_rate_limit,
+                    self.config.burst_allowance
+                )
+            
+            if not self.per_agent_limiters[agent_id].is_allowed(agent_id):
+                wait_time = self.per_agent_limiters[agent_id].get_wait_time(agent_id)
+                if self.metrics:
+                    self.metrics.record_rate_limit_hit("per_agent", agent_id)
+                    self.metrics.record_rate_limit_wait("per_agent", wait_time)
+                return False, wait_time
+        
+        return True, 0.0
+    
+    def validate_and_sanitize_message(self, message: Dict[str, Any]) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        """Validate and sanitize incoming message"""
+        start_time = time.time()
+        
+        # Validate message
+        valid, error = self.input_validator.validate_message(message)
+        if not valid:
+            if self.metrics:
+                self.metrics.record_validation_check("message", "failed", time.time() - start_time)
+            return False, error, message
+        
+        # Sanitize string fields
+        sanitized = message.copy()
+        for key, value in sanitized.items():
+            if isinstance(value, str):
+                sanitized[key] = self.input_validator.sanitize_string(value)
+        
+        if self.metrics:
+            self.metrics.record_validation_check("message", "success", time.time() - start_time)
+        
+        return True, None, sanitized
+    
+    def authenticate_request(self, auth_header: str, ip_address: str) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """Authenticate request using multiple methods"""
+        if not self.config.require_auth:
+            return True, None, {'agent_id': 'anonymous', 'permissions': ['read']}
+        
+        if not auth_header:
+            return False, "Authentication required", None
+        
+        # Try different authentication methods
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+            valid, error, data = self.auth_manager.validate_jwt_token(token, ip_address)
+            if self.metrics:
+                agent_id = data.get('agent_id', 'unknown') if data else 'unknown'
+                result = "success" if valid else "failed"
+                self.metrics.record_auth_attempt("jwt", result, agent_id)
+                if not valid:
+                    self.metrics.record_auth_failure("jwt", error or "unknown", ip_address)
+            return valid, error, data
+        elif auth_header.startswith('ApiKey '):
+            api_key = auth_header[7:]
+            valid, error, data = self.auth_manager.validate_api_key(api_key, ip_address)
+            if self.metrics:
+                agent_id = data.get('agent_id', 'unknown') if data else 'unknown'
+                result = "success" if valid else "failed"
+                self.metrics.record_auth_attempt("api_key", result, agent_id)
+                if not valid:
+                    self.metrics.record_auth_failure("api_key", error or "unknown", ip_address)
+            return valid, error, data
+        else:
+            return False, "Invalid authentication method", None
+    
+    def get_cors_headers(self, origin: str = None) -> Dict[str, str]:
+        """Get CORS headers for response"""
+        if not self.config.cors_enabled:
+            return {}
+        
+        headers = {}
+        
+        # Check if origin is allowed
+        if origin and (self.config.cors_origins == ["*"] or origin in self.config.cors_origins):
+            headers['Access-Control-Allow-Origin'] = origin
+        elif "*" in self.config.cors_origins:
+            headers['Access-Control-Allow-Origin'] = "*"
+        
+        headers['Access-Control-Allow-Methods'] = ", ".join(self.config.cors_methods)
+        headers['Access-Control-Allow-Headers'] = ", ".join(self.config.cors_headers)
+        headers['Access-Control-Max-Age'] = "86400"
+        
+        return headers
+    
+    def get_security_headers(self) -> Dict[str, str]:
+        """Get security headers for response"""
+        return self.config.security_headers.copy()
+    
+    def create_ssl_context(self) -> Optional[ssl.SSLContext]:
+        """Create SSL context for secure connections"""
+        if not self.config.tls_enabled or not self.config.cert_file:
+            return None
+        
+        try:
+            context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(self.config.cert_file, self.config.key_file)
+            
+            if self.config.ca_file:
+                context.load_verify_locations(self.config.ca_file)
+                context.verify_mode = ssl.CERT_REQUIRED
+            
+            return context
+        except Exception as e:
+            logger.error("Failed to create SSL context", error=str(e))
+            return None
+    
+    def log_security_event(self, event_type: str, user_id: str, ip_address: str, 
+                          details: Dict[str, Any], risk_level: SecurityLevel = SecurityLevel.LOW):
+        """Log security event"""
+        event = SecurityAuditEvent(event_type, user_id, ip_address, details, risk_level)
+        self.audit_logger.log_event(event)
+        
+        # Record metrics
+        if self.metrics:
+            self.metrics.record_security_event(event_type, risk_level.value)
     
     def get_security_status(self) -> Dict[str, Any]:
-        """Get security system status"""
-        now = datetime.now(timezone.utc)
-        
-        # Count events by severity in last 24 hours
-        recent_events = [e for e in self.security_events 
-                        if now - e.timestamp < timedelta(hours=24)]
-        
-        event_counts = {}
-        for event in recent_events:
-            event_counts[event.severity] = event_counts.get(event.severity, 0) + 1
-        
+        """Get comprehensive security status"""
         return {
-            "active_users": len([u for u in self.users.values() if u.is_active]),
-            "locked_users": len([u for u in self.users.values() if u.is_locked()]),
-            "active_sessions": len(self.active_sessions),
-            "rate_limited_identifiers": len(self.rate_limits),
-            "recent_events_24h": len(recent_events),
-            "event_counts_24h": event_counts,
-            "last_cleanup": now.isoformat()
+            'config': {
+                'auth_required': self.config.require_auth,
+                'rate_limiting_enabled': self.config.rate_limit_enabled,
+                'encryption_enabled': self.config.enable_encryption,
+                'tls_enabled': self.config.tls_enabled,
+                'cors_enabled': self.config.cors_enabled,
+                'audit_enabled': self.config.audit_enabled
+            },
+            'stats': {
+                'blocked_ips': len(self.auth_manager.blocked_ips),
+                'active_api_keys': len([k for k in self.auth_manager.api_keys.values() if k['active']]),
+                'recent_audit_events': len(self.audit_logger.audit_events),
+                'high_risk_events': len([e for e in self.audit_logger.audit_events 
+                                       if e.risk_level in [SecurityLevel.HIGH, SecurityLevel.CRITICAL]])
+            },
+            'health': {
+                'rate_limiter_active': True,
+                'audit_logger_active': self.audit_logger.log_file is not None,
+                'encryption_active': self.encryption_manager.fernet is not None
+            }
         }
-
-
-# Decorator for requiring authentication
-def require_auth(permission: Optional[Permission] = None):
-    """Decorator to require authentication and optionally a specific permission"""
-    def decorator(func):
-        async def wrapper(*args, **kwargs):
-            # This would be implemented based on your web framework
-            # For now, it's a placeholder showing the concept
-            
-            # Extract token from request headers
-            # Verify token
-            # Check permissions
-            # Call original function if authorized
-            
-            return await func(*args, **kwargs)
-        return wrapper
-    return decorator
-
-
-# Factory function for easy security manager creation
-def create_security_manager(
-    jwt_secret_key: str,
-    jwt_expiration_hours: int = 24,
-    rate_limit_requests: int = 100,
-    **kwargs
-) -> SecurityManager:
-    """Factory function to create a security manager"""
     
-    config = SecurityConfig(
-        jwt_secret_key=jwt_secret_key,
-        jwt_expiration_hours=jwt_expiration_hours,
-        rate_limit_requests=rate_limit_requests,
-        **kwargs
-    )
-    
-    return SecurityManager(config) 
+    def cleanup(self):
+        """Cleanup security resources"""
+        self.audit_logger.close()
+
+# Global security manager instance
+security_manager = SecurityManager() 

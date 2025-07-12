@@ -1,0 +1,16 @@
+[distutils]
+index-servers =
+    pypi
+   
+
+[pypi]
+username = __token__
+password = YOUR_REAL_PYPI_TOKEN_HERE
+
+
+
+# Instructions:
+# 1. Copy this file to your home directory as .pypirc
+# 2. Replace YOUR_REAL_PYPI_TOKEN_HERE with your actual PyPI API token
+# 3. Replace YOUR_TESTPYPI_TOKEN_HERE with your actual TestPyPI API token
+# 4. Make sure the file permissions are secure (chmod 600 .pypirc on Unix) 

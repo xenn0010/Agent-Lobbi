@@ -1,5 +1,5 @@
 """
-World State Management for Agent Lobby
+World State Management for Agent Lobbi
 Handles persistent state that agents can read/write to
 """
 import json

@@ -1,5 +1,5 @@
 """
-Agent Learning Capabilities for Agent Lobby
+Agent Learning Capabilities for Agent Lobbi
 Defines learning capabilities and sessions for collaborative learning
 """
 from dataclasses import dataclass, field

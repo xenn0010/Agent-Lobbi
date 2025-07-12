@@ -59,7 +59,7 @@ type SDKConfig struct {
 	Logger              *log.Logger
 }
 
-// EnhancedEcosystemClientGo is the Go SDK client for the Agent Lobby
+// EnhancedEcosystemClientGo is the Go SDK client for the Agent Lobbi
 type EnhancedEcosystemClientGo struct {
 	config         SDKConfig
 	authToken      string

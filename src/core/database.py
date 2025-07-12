@@ -1,5 +1,5 @@
 """
-Production Database Layer for Agent Lobby
+Production Database Layer for Agent Lobbi
 Supports PostgreSQL (production) and SQLite (development)
 """
 import asyncio
@@ -7,7 +7,13 @@ import os
 from typing import Dict, List, Any, Optional, Union
 from datetime import datetime, timezone
 import json
-import structlog
+try:
+    import structlog
+    HAS_STRUCTLOG = True
+except ImportError:
+    structlog = None
+    HAS_STRUCTLOG = False
+    import logging
 from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -17,7 +23,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 import uuid
 
-logger = structlog.get_logger(__name__)
+logger = structlog.get_logger(__name__) if HAS_STRUCTLOG else logging.getLogger(__name__)
 
 class Base(DeclarativeBase):
     """Base class for all database models"""
@@ -34,6 +40,7 @@ class Agent(Base):
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
     agent_metadata: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+    name: Mapped[str] = mapped_column(String, nullable=True)  # Add name field
 
 class Workflow(Base):
     __tablename__ = "workflows"
@@ -77,12 +84,31 @@ class AgentMetrics(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
 
 class DatabaseManager:
-    """Production-ready database manager with async support"""
+    """Production-ready database manager with async support and Redis optimization"""
     
-    def __init__(self, database_url: Optional[str] = None):
+    def __init__(self, database_url: Optional[str] = None, enable_redis: bool = True):
         self.database_url = database_url or self._get_database_url()
         self.engine = None
         self.session_factory = None
+        self.enable_redis = enable_redis
+        self.redis_db = None
+        
+        # Try to import Redis database with improved error handling
+        if enable_redis:
+            try:
+                from .redis_database import RedisAgentDatabase, REDIS_AVAILABLE
+                if REDIS_AVAILABLE:
+                    self.redis_db = RedisAgentDatabase()
+                    logger.info("Redis database module loaded successfully")
+                else:
+                    logger.warning("Redis module loaded but Redis not available, falling back to SQLite")
+                    self.redis_db = None
+            except ImportError as e:
+                logger.warning("Redis module not available, falling back to SQLite for all operations", error=str(e))
+                self.redis_db = None
+            except Exception as e:
+                logger.warning("Redis initialization failed, falling back to SQLite", error=str(e))
+                self.redis_db = None
         
     def _get_database_url(self) -> str:
         """Get database URL from environment or default to SQLite"""
@@ -106,6 +132,15 @@ class DatabaseManager:
     async def initialize(self):
         """Initialize database connection and create tables"""
         try:
+            # Initialize Redis first (if enabled)
+            if self.redis_db:
+                try:
+                    await self.redis_db.initialize()
+                    logger.info("Redis database initialized for high-performance operations")
+                except Exception as e:
+                    logger.warning("Redis initialization failed, falling back to SQLite", error=str(e))
+                    self.redis_db = None
+            
             # Create async engine with connection pooling
             self.engine = create_async_engine(
                 self.database_url,
@@ -127,7 +162,8 @@ class DatabaseManager:
             async with self.engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             
-            logger.info("Database initialized successfully", url=self.database_url)
+            db_type = "Hybrid (Redis + SQLite)" if self.redis_db else "SQLite only"
+            logger.info("Database initialized successfully", url=self.database_url, type=db_type)
             
         except Exception as e:
             logger.error("Failed to initialize database", error=str(e))
@@ -150,9 +186,20 @@ class DatabaseManager:
                 await session.rollback()
                 raise
     
-    # Agent Operations
+    # Agent Operations (Redis-optimized)
     async def save_agent(self, agent_data: Dict[str, Any]) -> bool:
-        """Save or update agent data"""
+        """Save or update agent data (Redis-first with SQLite fallback)"""
+        # Try Redis first for high performance
+        if self.redis_db:
+            try:
+                success = await self.redis_db.save_agent(agent_data)
+                if success:
+                    logger.debug("Agent saved to Redis", agent_id=agent_data.get("id"))
+                    return True
+            except Exception as e:
+                logger.warning("Redis save failed, falling back to SQLite", error=str(e))
+        
+        # Fallback to SQLite
         try:
             async with self.get_session() as session:
                 # Check if agent exists
@@ -175,7 +222,18 @@ class DatabaseManager:
             return False
     
     async def get_agent(self, agent_id: str) -> Optional[Dict[str, Any]]:
-        """Get agent by ID"""
+        """Get agent by ID (Redis-first with SQLite fallback)"""
+        # Try Redis first for high performance
+        if self.redis_db:
+            try:
+                agent_data = await self.redis_db.get_agent(agent_id)
+                if agent_data:
+                    logger.debug("Agent retrieved from Redis", agent_id=agent_id)
+                    return agent_data
+            except Exception as e:
+                logger.warning("Redis get failed, falling back to SQLite", error=str(e))
+        
+        # Fallback to SQLite
         try:
             async with self.get_session() as session:
                 result = await session.execute(select(Agent).where(Agent.id == agent_id))
@@ -198,7 +256,18 @@ class DatabaseManager:
             return None
     
     async def get_all_agents(self) -> List[Dict[str, Any]]:
-        """Get all active agents"""
+        """Get all active agents (Redis-first with SQLite fallback)"""
+        # Try Redis first for high performance
+        if self.redis_db:
+            try:
+                agents = await self.redis_db.get_all_agents()
+                if agents is not None:  # Empty list is valid
+                    logger.debug("All agents retrieved from Redis", count=len(agents))
+                    return agents
+            except Exception as e:
+                logger.warning("Redis get_all failed, falling back to SQLite", error=str(e))
+        
+        # Fallback to SQLite
         try:
             async with self.get_session() as session:
                 result = await session.execute(select(Agent).where(Agent.status == "online"))

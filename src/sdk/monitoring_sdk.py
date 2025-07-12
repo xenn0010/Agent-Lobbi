@@ -1,5 +1,5 @@
 """
-Production Monitoring SDK for Agent Lobby
+Production Monitoring SDK for Agent Lobbi
 Includes metrics, health checks, error recovery, and observability
 """
 import asyncio

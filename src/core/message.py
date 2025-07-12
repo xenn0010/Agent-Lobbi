@@ -30,6 +30,7 @@ class MessageType(Enum):
     HEALTH_CHECK = auto()     # New: For agent health monitoring
     CAPABILITY_UPDATE = auto() # New: For dynamic capability updates
     TASK_OUTCOME_REPORT = auto() # New: For agents to report task success/failure to Lobby for reputation
+    TASK_COMPLETION = auto()     # For task completion responses from agents
     
     # Learning Collaboration Messages
     CREATE_LEARNING_SESSION = auto()    # Request to create a learning session
@@ -42,6 +43,10 @@ class MessageType(Enum):
     RUN_MODEL_TEST = auto()            # Run model test in sandbox
     GET_TEST_RESULTS = auto()          # Retrieve test results
     LEARNING_SESSION_UPDATE = auto()    # Notify about session changes
+
+    # New message types for learning & collaboration
+    REQUEST_TASK_ASSISTANCE = auto()
+    TASK_ASSIGNMENT = auto()  # For task assignment to agents
 
 class MessageValidationError(Exception):
     """Raised when message validation fails."""

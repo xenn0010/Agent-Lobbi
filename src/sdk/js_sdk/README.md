@@ -1,6 +1,6 @@
-# Agent Lobby JavaScript SDK (@agent-lobby/sdk)
+# Agent Lobbi JavaScript SDK (@agent-lobby/sdk)
 
-This SDK provides a JavaScript client for interacting with the Agent Lobby ecosystem, suitable for Node.js environments.
+This SDK provides a JavaScript client for interacting with the Agent Lobbi ecosystem, suitable for Node.js environments.
 
 ## Installation
 
@@ -135,4 +135,4 @@ The `EnhancedEcosystemClientJS` expects an `SDKConfigJS` instance. This configur
 - `registrationTimeout` (optional): Milliseconds for HTTP registration request timeout.
 - `websocketTimeout` (optional): Milliseconds for WebSocket connection handshake timeout.
 
-Ensure these values, especially the URLs and API key, match your Agent Lobby server configuration. 
+Ensure these values, especially the URLs and API key, match your Agent Lobbi server configuration. 

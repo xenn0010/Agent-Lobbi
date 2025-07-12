@@ -4,7 +4,7 @@ DATA BUS + TRAFFIC LIGHT ORCHESTRATION SYSTEM
 ============================================
 A masterpiece of multi-agent collaboration engineering.
 
-This system solves the Agent Lobby's core problems:
+This system solves the Agent Lobbi's core problems:
 1. Standardized JSON communication (Data Bus)
 2. Stage-based orchestration (Traffic Lights) 
 3. Proper multi-agent distribution
@@ -275,14 +275,14 @@ class WorkflowOrchestrator:
         self.stage_definitions: Dict[str, StageDefinition] = {}
         self.active_workflows: Dict[str, Dict[str, Any]] = {}
         
-        logger.info("🎛️ Workflow Orchestrator initialized")
+        logger.info(" Workflow Orchestrator initialized")
     
     def register_stage(self, stage_def: StageDefinition):
         """Register a new orchestration stage"""
         self.stage_definitions[stage_def.stage_name] = stage_def
         self.traffic_lights[stage_def.stage_name] = TrafficLight(stage_def, self)
         
-        logger.info(f"🎛️ Registered stage: {stage_def.stage_name}")
+        logger.info(f" Registered stage: {stage_def.stage_name}")
     
     async def start_workflow(self, workflow_name: str, goal: str, initial_data: Dict[str, Any], 
                            entry_stage: str, requester_id: str) -> str:
@@ -311,7 +311,7 @@ class WorkflowOrchestrator:
             "current_stages": [entry_stage]
         }
         
-        logger.info(f"🎛️ Starting workflow: {workflow_name}")
+        logger.info(f" Starting workflow: {workflow_name}")
         logger.info(f"   ID: {workflow_id}")
         logger.info(f"   Goal: {goal}")
         logger.info(f"   Entry Stage: {entry_stage}")
@@ -329,7 +329,7 @@ class WorkflowOrchestrator:
         stage_name = message.current_stage
         
         if stage_name not in self.traffic_lights:
-            logger.error(f"🎛️ Unknown stage: {stage_name}")
+            logger.error(f" Unknown stage: {stage_name}")
             return False
         
         traffic_light = self.traffic_lights[stage_name]
@@ -342,8 +342,34 @@ class WorkflowOrchestrator:
             if task_id in traffic_light.processing_queue:
                 return await traffic_light.handle_agent_response(task_id, response)
         
-        logger.error(f"🎛️ No traffic light found for task {task_id}")
-        return False
+        # **FIXED: Handle tasks not in traffic lights (delegation integration)**
+        logger.warning(f" Task {task_id} not found in traffic lights, may be from delegation system")
+        
+        # If this is a delegation-based task, create a workflow entry for it
+        if workflow_id and workflow_id not in self.active_workflows:
+            logger.info(f" Creating workflow entry for delegation workflow {workflow_id}")
+            self.active_workflows[workflow_id] = {
+                "name": f"Delegation Workflow {workflow_id[:8]}",
+                "goal": "Delegation-based task execution",
+                "requester_id": "delegation_system",
+                "started_at": datetime.now(timezone.utc),
+                "status": "running",
+                "stages_completed": [],
+                "current_stages": []
+            }
+        
+        # Log the response for delegation integration
+        logger.info(f" Delegation task {task_id} completed with status: {response.get('status', 'unknown')}")
+        
+        # Update workflow if exists
+        if workflow_id in self.active_workflows:
+            workflow = self.active_workflows[workflow_id]
+            if response.get("status") == "success":
+                workflow["status"] = "completed"
+                workflow["completed_at"] = datetime.now(timezone.utc)
+                logger.info(f" Delegation workflow {workflow_id} marked as completed")
+        
+        return True
     
     async def handle_workflow_completion(self, final_message: StandardizedMessage):
         """Handle workflow completion"""
@@ -355,7 +381,7 @@ class WorkflowOrchestrator:
             workflow["completed_at"] = datetime.now(timezone.utc)
             workflow["final_result"] = final_message.data_payload
             
-            logger.info(f"🎛️ Workflow completed: {workflow['name']}")
+            logger.info(f" Workflow completed: {workflow['name']}")
             logger.info(f"   ID: {workflow_id}")
             logger.info(f"   Goal achieved: {final_message.destination_goal}")
             
@@ -365,23 +391,43 @@ class WorkflowOrchestrator:
     async def _notify_workflow_completion(self, workflow: Dict[str, Any], final_message: StandardizedMessage):
         """Notify workflow requester of completion"""
         # This would integrate with the lobby's message system
-        logger.info(f"🎛️ Notifying requester: {workflow['requester_id']}")
+        logger.info(f" Notifying requester: {workflow['requester_id']}")
     
     async def send_task_to_agent(self, agent_id: str, task_payload: Dict[str, Any], workflow_id: str):
-        """Send task to agent through lobby"""
-        # This integrates with the existing lobby message system
-        from .message import Message, MessageType, MessagePriority
+        """Send task to agent through lobby's proven assignment method"""
+        logger.info(f" DataBus assigning task to {agent_id} via lobby")
         
-        message = Message(
-            sender_id=self.lobby.lobby_id,
-            receiver_id=agent_id,
-            message_type=MessageType.REQUEST,
-            payload=task_payload,
-            conversation_id=workflow_id,
-            priority=MessagePriority.HIGH
-        )
-        
-        await self.lobby._process_single_message(message)
+        try:
+            # Use lobby's proven task assignment method (used by successful delegation)
+            if hasattr(self.lobby, 'assign_task_to_agent'):
+                await self.lobby.assign_task_to_agent(agent_id, task_payload)
+                logger.info(f" Task successfully assigned to {agent_id}")
+            else:
+                # Fallback to message system
+                logger.info(f" Using message system for {agent_id}")
+                from .message import Message, MessageType, MessagePriority
+                
+                message = Message(
+                    sender_id=self.lobby.lobby_id,
+                    receiver_id=agent_id,
+                    message_type=MessageType.REQUEST,
+                    payload=task_payload,
+                    conversation_id=workflow_id,
+                    priority=MessagePriority.HIGH
+                )
+                
+                await self.lobby._process_single_message(message)
+                
+        except Exception as e:
+            logger.error(f" Failed to assign DataBus task to {agent_id}: {e}")
+            # Generate error response
+            response = {
+                "status": "error",
+                "error": f"Task assignment failed: {str(e)}"
+            }
+            task_id = task_payload.get("task_id")
+            if task_id:
+                await self.handle_agent_response(task_id, response, workflow_id)
     
     def get_workflow_status(self, workflow_id: str) -> Optional[Dict[str, Any]]:
         """Get workflow status"""
