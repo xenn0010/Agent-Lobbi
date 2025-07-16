@@ -33,7 +33,7 @@ except ImportError:
     monitoring_sdk = None
     MonitoringConfig = None
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __author__ = "Agent Lobbi Team"
 __description__ = "Secure multi-agent collaboration platform with honest engineering"
 

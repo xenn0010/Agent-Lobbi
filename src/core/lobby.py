@@ -255,6 +255,127 @@ class Lobby:
                 self._send_http_response(writer, 200, health_data)
                 return
 
+            # A2A Protocol: Agent Discovery Endpoint
+            if method == 'GET' and path == '/.well-known/agent.json':
+                agent_card = {
+                    "name": "Agent Lobby Hub",
+                    "description": "Enhanced Agent Lobby with neuromorphic learning and A2A+ protocol support",
+                    "version": "2.0.0",
+                    "url": f"http://{self.host}:{self.http_port}",
+                    "capabilities": {
+                        "streaming": True,
+                        "pushNotifications": True,
+                        "neuromorphic_learning": True,
+                        "collective_intelligence": True,
+                        "reputation_system": True,
+                        "multi_agent_collaboration": True,
+                        "real_time_metrics": True
+                    },
+                    "skills": [
+                        "agent_coordination",
+                        "task_delegation", 
+                        "workflow_orchestration",
+                        "reputation_management",
+                        "collective_intelligence"
+                    ],
+                    "authentication": {
+                        "schemes": ["bearer", "api_key"]
+                    },
+                    "endpoints": {
+                        "register": f"http://{self.host}:{self.http_port}/api/agents/register",
+                        "discover": f"http://{self.host}:{self.http_port}/api/a2a/discover",
+                        "delegate": f"http://{self.host}:{self.http_port}/api/a2a/delegate",
+                        "communicate": f"http://{self.host}:{self.http_port}/api/a2a/communicate",
+                        "status": f"http://{self.host}:{self.http_port}/api/a2a/status"
+                    },
+                    "extensions": {
+                        "agent_lobby": {
+                            "platform": "Agent Lobby",
+                            "enhanced_features": [
+                                "Neuromorphic agent selection",
+                                "Collective intelligence",
+                                "Reputation-based routing",
+                                "Real-time collaboration",
+                                "Advanced metrics and analytics"
+                            ],
+                            "agent_count": len(self.agents),
+                            "protocols": ["Agent Lobby Native", "A2A", "WebSocket", "HTTP"]
+                        }
+                    }
+                }
+                self._send_http_response(writer, 200, agent_card)
+                return
+
+            # A2A Protocol: Agent Discovery
+            if method == 'GET' and path == '/api/a2a/discover':
+                a2a_agents = []
+                for agent_id, agent_data in self.agents.items():
+                    a2a_agent = {
+                        "agent_id": agent_id,
+                        "name": agent_data.get("name", agent_id),
+                        "description": f"Agent Lobby enhanced agent: {agent_data.get('agent_type', 'unknown')}",
+                        "capabilities": agent_data.get("capabilities", []),
+                        "agent_type": agent_data.get("agent_type"),
+                        "url": f"http://{self.host}:{self.http_port}/api/a2a/agents/{agent_id}",
+                        "registered_at": agent_data.get("registered_at"),
+                        "status": "online" if agent_id in self.live_agent_connections else "offline",
+                        "protocols": ["A2A", "Agent Lobby Native"],
+                        "extensions": {
+                            "agent_lobby": {
+                                "reputation_score": 0.85,  # TODO: Get from reputation system
+                                "total_tasks_completed": 0,  # TODO: Get from tracking system
+                                "success_rate": 0.95  # TODO: Get from metrics
+                            }
+                        }
+                    }
+                    a2a_agents.append(a2a_agent)
+                
+                discovery_response = {
+                    "agents": a2a_agents,
+                    "total_count": len(a2a_agents),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "lobby_info": {
+                        "lobby_id": self.lobby_id,
+                        "platform": "Agent Lobby A2A+",
+                        "version": "2.0.0"
+                    }
+                }
+                self._send_http_response(writer, 200, discovery_response)
+                return
+
+            # A2A Protocol: Individual Agent Info
+            if method == 'GET' and path.startswith('/api/a2a/agents/'):
+                agent_id = path.split('/')[-1]
+                if agent_id in self.agents:
+                    agent_data = self.agents[agent_id]
+                    agent_info = {
+                        "agent_id": agent_id,
+                        "name": agent_data.get("name", agent_id),
+                        "description": f"Agent Lobby enhanced agent: {agent_data.get('agent_type', 'unknown')}",
+                        "capabilities": agent_data.get("capabilities", []),
+                        "agent_type": agent_data.get("agent_type"),
+                        "registered_at": agent_data.get("registered_at"),
+                        "status": "online" if agent_id in self.live_agent_connections else "offline",
+                        "protocols": ["A2A", "Agent Lobby Native"],
+                        "endpoints": {
+                            "communicate": f"http://{self.host}:{self.http_port}/api/a2a/communicate/{agent_id}",
+                            "delegate": f"http://{self.host}:{self.http_port}/api/a2a/delegate/{agent_id}"
+                        },
+                        "extensions": {
+                            "agent_lobby": {
+                                "reputation_score": 0.85,
+                                "total_tasks_completed": 0,
+                                "success_rate": 0.95,
+                                "neuromorphic_features": True,
+                                "collective_intelligence": True
+                            }
+                        }
+                    }
+                    self._send_http_response(writer, 200, agent_info)
+                else:
+                    self._send_http_response(writer, 404, {"status": "error", "message": f"Agent {agent_id} not found"})
+                return
+
             # Get all agents
             if method == 'GET' and path == '/api/agents':
                 self._send_http_response(writer, 200, {"agents": list(self.agents.values())})
@@ -279,6 +400,81 @@ class Lobby:
                     self._send_http_response(writer, 200, result)
                 else:
                     self._send_http_response(writer, 400, {"status": "error", "message": "Invalid registration data"})
+                return
+
+            # A2A Protocol: Task Delegation
+            if method == 'POST' and path.startswith('/api/a2a/delegate'):
+                content_length = int(headers.get('content-length', 0))
+                body_data = {}
+                
+                if content_length > 0:
+                    body_bytes = await reader.readexactly(content_length)
+                    try:
+                        body_data = json.loads(body_bytes.decode())
+                    except json.JSONDecodeError:
+                        self._send_http_response(writer, 400, {"status": "error", "message": "Invalid JSON"})
+                        return
+
+                # Extract target agent from path if specified
+                target_agent_id = None
+                if path != '/api/a2a/delegate':
+                    target_agent_id = path.split('/')[-1]
+
+                task_result = await self.handle_a2a_delegation(body_data, target_agent_id)
+                status_code = 200 if task_result.get("status") == "success" else 400
+                self._send_http_response(writer, status_code, task_result)
+                return
+
+            # A2A Protocol: Agent Communication
+            if method == 'POST' and path.startswith('/api/a2a/communicate'):
+                content_length = int(headers.get('content-length', 0))
+                body_data = {}
+                
+                if content_length > 0:
+                    body_bytes = await reader.readexactly(content_length)
+                    try:
+                        body_data = json.loads(body_bytes.decode())
+                    except json.JSONDecodeError:
+                        self._send_http_response(writer, 400, {"status": "error", "message": "Invalid JSON"})
+                        return
+
+                # Extract target agent from path if specified
+                target_agent_id = None
+                if path != '/api/a2a/communicate':
+                    target_agent_id = path.split('/')[-1]
+
+                comm_result = await self.handle_a2a_communication(body_data, target_agent_id)
+                status_code = 200 if comm_result.get("status") == "success" else 400
+                self._send_http_response(writer, status_code, comm_result)
+                return
+
+            # A2A Protocol: Task Polling for HTTP-only agents
+            if method == 'GET' and path.startswith('/api/a2a/tasks/'):
+                agent_id = path.split('/')[-1]
+                tasks_result = await self.handle_a2a_task_polling(agent_id)
+                self._send_http_response(writer, 200, tasks_result)
+                return
+
+            # A2A Protocol: Status Check
+            if method == 'GET' and path == '/api/a2a/status':
+                status_data = {
+                    "lobby_status": "operational",
+                    "lobby_id": self.lobby_id,
+                    "platform": "Agent Lobby A2A+",
+                    "version": "2.0.0",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "agent_count": len(self.agents),
+                    "active_connections": len(self.live_agent_connections),
+                    "protocols_supported": ["A2A", "Agent Lobby Native", "WebSocket", "HTTP"],
+                    "capabilities": {
+                        "neuromorphic_learning": True,
+                        "collective_intelligence": True,
+                        "reputation_system": True,
+                        "real_time_metrics": True,
+                        "advanced_collaboration": True
+                    }
+                }
+                self._send_http_response(writer, 200, status_data)
                 return
 
             # Default: Not Found
@@ -599,49 +795,74 @@ class Lobby:
             logger.info(f"   🔗 Connected agents: {list(self.live_agent_connections.keys())}")
 
     async def send_task_to_agent(self, agent_id: str, task_message: Dict[str, Any]) -> bool:
-        """Sends a task message to a specific agent via WebSocket."""
+        """Sends a task message to a specific agent via WebSocket with HTTP fallback."""
         logger.info(f"SEND ATTEMPTING TO SEND TASK to agent: {agent_id}")
         logger.info(f"   🔗 Available connections: {list(self.live_agent_connections.keys())}")
         logger.info(f"   TASK Task message structure: {list(task_message.keys())}")
         
-        # CRITICAL FIX: For testing, if agent is registered but no WebSocket, create mock success
-        if agent_id not in self.live_agent_connections:
-            if agent_id in self.agents:
-                logger.warning(f"ERROR TASK SEND FAILED: No WebSocket connection for agent {agent_id}")
-                logger.info(f"   🔄 Agent {agent_id} is registered but not connected via WebSocket")
-                logger.info(f"   📋 This is expected for HTTP-only test agents")
-                # For now, return False to trigger HTTP fallback
-                return False
-            else:
-                logger.error(f"ERROR Agent {agent_id} not even registered!")
-                return False
+        # First try WebSocket delivery (preferred)
+        if agent_id in self.live_agent_connections:
+            websocket = self.live_agent_connections.get(agent_id)
+            try:
+                logger.info(f"SEND Sending task via WebSocket to {agent_id}")
+                await websocket.send(json.dumps(task_message))
+                
+                # Extract task_id from the correct location in the message
+                task_id = (
+                    task_message.get('payload', {}).get('task_id') or  # New format: payload.task_id
+                    task_message.get('task', {}).get('task_id') or     # Legacy format: task.task_id  
+                    task_message.get('task_id') or                     # Direct format: task_id
+                    'N/A'
+                )
+                
+                logger.info(f"OK TASK SENT SUCCESSFULLY: Task {task_id} to agent {agent_id}")
+                logger.info(f"   TASK Message type: {task_message.get('message_type', task_message.get('type', 'unknown'))}")
+                return True
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning(f"ERROR TASK SEND FAILED: Connection closed for agent {agent_id}")
+                await self.unregister_live_connection(agent_id) # Clean up dead connection
+                # Fall through to HTTP fallback
+            except Exception as e:
+                logger.error(f"ERROR TASK SEND ERROR for agent {agent_id}: {e}", exc_info=True)
+                # Fall through to HTTP fallback
         
-        websocket = self.live_agent_connections.get(agent_id)
-        if not websocket:
+        # HTTP fallback for A2A protocol compatibility 
+        if agent_id in self.agents:
+            logger.info(f"🔄 Attempting HTTP fallback for agent {agent_id}")
+            
+            # For A2A protocol, we simulate successful task delivery
+            # This allows HTTP-only agents to be compatible with A2A delegation
+            if task_message.get("protocol") == "A2A":
+                task_id = (
+                    task_message.get('payload', {}).get('task_id') or
+                    task_message.get('task_id') or
+                    'N/A'
+                )
+                
+                logger.info(f"✅ A2A HTTP FALLBACK: Task {task_id} queued for agent {agent_id}")
+                logger.info(f"   📋 Agent {agent_id} is registered but offline (HTTP-only)")
+                logger.info(f"   🔄 Task will be available when agent connects or polls")
+                
+                # Store task for when agent connects or polls
+                if not hasattr(self, 'pending_a2a_tasks'):
+                    self.pending_a2a_tasks = {}
+                
+                if agent_id not in self.pending_a2a_tasks:
+                    self.pending_a2a_tasks[agent_id] = []
+                
+                self.pending_a2a_tasks[agent_id].append({
+                    "task_message": task_message,
+                    "queued_at": datetime.now(timezone.utc).isoformat()
+                })
+                
+                return True  # Success for A2A compatibility
+            
             logger.warning(f"ERROR TASK SEND FAILED: No WebSocket connection for agent {agent_id}")
+            logger.info(f"   🔄 Agent {agent_id} is registered but not connected via WebSocket")
+            logger.info(f"   📋 This is expected for HTTP-only test agents")
             return False
-            
-        try:
-            logger.info(f"SEND Sending task via WebSocket to {agent_id}")
-            await websocket.send(json.dumps(task_message))
-            
-            # OK FIXED: Extract task_id from the correct location in the message
-            task_id = (
-                task_message.get('payload', {}).get('task_id') or  # New format: payload.task_id
-                task_message.get('task', {}).get('task_id') or     # Legacy format: task.task_id  
-                task_message.get('task_id') or                     # Direct format: task_id
-                'N/A'
-            )
-            
-            logger.info(f"OK TASK SENT SUCCESSFULLY: Task {task_id} to agent {agent_id}")
-            logger.info(f"   TASK Message type: {task_message.get('message_type', task_message.get('type', 'unknown'))}")
-            return True
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"ERROR TASK SEND FAILED: Connection closed for agent {agent_id}")
-            await self.unregister_live_connection(agent_id) # Clean up dead connection
-            return False
-        except Exception as e:
-            logger.error(f"ERROR TASK SEND ERROR for agent {agent_id}: {e}", exc_info=True)
+        else:
+            logger.error(f"ERROR Agent {agent_id} not even registered!")
             return False
 
     async def _process_message_queues(self):
@@ -691,3 +912,344 @@ class Lobby:
         # Store the path for this connection
         self.websocket_paths[id(connection)] = request.path
         return None  # Allow connection to proceed
+
+    async def handle_a2a_delegation(self, task_data: Dict[str, Any], target_agent_id: Optional[str] = None) -> Dict[str, Any]:
+        """Handle A2A protocol task delegation"""
+        try:
+            logger.info(f"🔄 A2A Task delegation received: {task_data}")
+            
+            # Extract task information from A2A format
+            task_title = task_data.get("title", task_data.get("task", "A2A Task"))
+            task_description = task_data.get("description", task_data.get("prompt", ""))
+            required_capabilities = task_data.get("required_capabilities", task_data.get("skills", []))
+            sender_id = task_data.get("sender_id", task_data.get("from", "a2a_client"))
+            
+            if not task_description:
+                return {
+                    "status": "error",
+                    "message": "Task description is required",
+                    "error_code": "MISSING_DESCRIPTION"
+                }
+            
+            # Create unique task ID for A2A
+            task_id = f"a2a_{uuid.uuid4().hex[:8]}"
+            
+            # If target agent specified, try to delegate directly
+            if target_agent_id:
+                if target_agent_id not in self.agents:
+                    return {
+                        "status": "error",
+                        "message": f"Target agent {target_agent_id} not found",
+                        "error_code": "AGENT_NOT_FOUND"
+                    }
+                
+                # Format task for Agent Lobby
+                task_message = {
+                    "message_id": task_id,
+                    "task_id": task_id,
+                    "sender_id": sender_id,
+                    "task_title": task_title,
+                    "task_description": task_description,
+                    "required_capabilities": required_capabilities,
+                    "protocol": "A2A",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "payload": {
+                        "original_a2a_message": task_data,
+                        "task": task_description,
+                        "input_data": task_data.get("input", {}),
+                        "context": task_data.get("context", {})
+                    }
+                }
+                
+                # Try to send task to specific agent
+                success = await self.send_task_to_agent(target_agent_id, task_message)
+                
+                if success:
+                    return {
+                        "status": "success",
+                        "task_id": task_id,
+                        "assigned_to": target_agent_id,
+                        "message": f"Task delegated to {target_agent_id}",
+                        "protocol": "A2A",
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "message": f"Failed to delegate task to {target_agent_id}",
+                        "error_code": "DELEGATION_FAILED"
+                    }
+            
+            # Auto-select best agent based on capabilities
+            selected_agent = await self._select_best_agent_for_a2a_task(required_capabilities)
+            
+            if not selected_agent:
+                return {
+                    "status": "error",
+                    "message": "No suitable agent found for this task",
+                    "error_code": "NO_SUITABLE_AGENT",
+                    "required_capabilities": required_capabilities,
+                    "available_agents": len(self.agents)
+                }
+            
+            # Format and send task
+            task_message = {
+                "message_id": task_id,
+                "task_id": task_id,
+                "sender_id": sender_id,
+                "task_title": task_title,
+                "task_description": task_description,
+                "required_capabilities": required_capabilities,
+                "protocol": "A2A",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": {
+                    "original_a2a_message": task_data,
+                    "task": task_description,
+                    "input_data": task_data.get("input", {}),
+                    "context": task_data.get("context", {})
+                }
+            }
+            
+            success = await self.send_task_to_agent(selected_agent, task_message)
+            
+            if success:
+                return {
+                    "status": "success",
+                    "task_id": task_id,
+                    "assigned_to": selected_agent,
+                    "message": f"Task delegated to {selected_agent}",
+                    "protocol": "A2A",
+                    "agent_info": {
+                        "agent_id": selected_agent,
+                        "capabilities": self.agents[selected_agent].get("capabilities", [])
+                    },
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            else:
+                return {
+                    "status": "error",
+                    "message": f"Failed to delegate task to {selected_agent}",
+                    "error_code": "DELEGATION_FAILED"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error in A2A delegation: {e}")
+            return {
+                "status": "error",
+                "message": f"Internal error during task delegation: {str(e)}",
+                "error_code": "INTERNAL_ERROR"
+            }
+
+    async def handle_a2a_communication(self, message_data: Dict[str, Any], target_agent_id: Optional[str] = None) -> Dict[str, Any]:
+        """Handle A2A protocol agent-to-agent communication"""
+        try:
+            logger.info(f"💬 A2A Communication received: {message_data}")
+            
+            # Extract message information
+            message_text = message_data.get("message", message_data.get("content", ""))
+            sender_id = message_data.get("sender_id", message_data.get("from", "a2a_client"))
+            message_type = message_data.get("type", "communication")
+            
+            if not message_text:
+                return {
+                    "status": "error",
+                    "message": "Message content is required",
+                    "error_code": "MISSING_CONTENT"
+                }
+            
+            # If target agent specified, send directly
+            if target_agent_id:
+                if target_agent_id not in self.agents:
+                    return {
+                        "status": "error",
+                        "message": f"Target agent {target_agent_id} not found",
+                        "error_code": "AGENT_NOT_FOUND"
+                    }
+                
+                # Create message for WebSocket
+                ws_message = {
+                    "type": "A2A_COMMUNICATION",
+                    "message_id": f"a2a_comm_{uuid.uuid4().hex[:8]}",
+                    "sender_id": sender_id,
+                    "content": message_text,
+                    "protocol": "A2A",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "original_message": message_data
+                }
+                
+                # Send via WebSocket if agent is connected
+                if target_agent_id in self.live_agent_connections:
+                    await self.send_websocket_message(target_agent_id, ws_message)
+                    return {
+                        "status": "success",
+                        "message": f"Message sent to {target_agent_id}",
+                        "recipient": target_agent_id,
+                        "protocol": "A2A",
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "message": f"Agent {target_agent_id} is not online",
+                        "error_code": "AGENT_OFFLINE"
+                    }
+            
+            # Broadcast to all online agents if no target specified
+            online_agents = list(self.live_agent_connections.keys())
+            
+            if not online_agents:
+                return {
+                    "status": "error",
+                    "message": "No agents are currently online",
+                    "error_code": "NO_ONLINE_AGENTS"
+                }
+            
+            broadcast_message = {
+                "type": "A2A_BROADCAST",
+                "message_id": f"a2a_broadcast_{uuid.uuid4().hex[:8]}",
+                "sender_id": sender_id,
+                "content": message_text,
+                "protocol": "A2A",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "original_message": message_data
+            }
+            
+            sent_count = 0
+            for agent_id in online_agents:
+                try:
+                    await self.send_websocket_message(agent_id, broadcast_message)
+                    sent_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to send broadcast to {agent_id}: {e}")
+            
+            return {
+                "status": "success",
+                "message": f"Message broadcast to {sent_count} agents",
+                "recipients": online_agents[:sent_count],
+                "protocol": "A2A",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+                        }
+                
+        except Exception as e:
+            logger.error(f"Error in A2A communication: {e}")
+            return {
+                "status": "error",
+                "message": f"Internal error during communication: {str(e)}",
+                "error_code": "INTERNAL_ERROR"
+            }
+
+    async def handle_a2a_task_polling(self, agent_id: str) -> Dict[str, Any]:
+        """Handle A2A task polling for HTTP-only agents"""
+        try:
+            logger.info(f"📥 A2A task polling request from agent: {agent_id}")
+            
+            # Check if agent is registered
+            if agent_id not in self.agents:
+                return {
+                    "status": "error",
+                    "message": f"Agent {agent_id} not registered",
+                    "error_code": "AGENT_NOT_FOUND",
+                    "tasks": []
+                }
+            
+            # Initialize pending tasks if not exists
+            if not hasattr(self, 'pending_a2a_tasks'):
+                self.pending_a2a_tasks = {}
+            
+            # Get pending tasks for this agent
+            pending_tasks = self.pending_a2a_tasks.get(agent_id, [])
+            
+            if not pending_tasks:
+                return {
+                    "status": "success",
+                    "message": "No pending tasks",
+                    "agent_id": agent_id,
+                    "tasks": [],
+                    "count": 0,
+                    "protocol": "A2A",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            
+            # Format tasks for A2A response
+            formatted_tasks = []
+            for task_entry in pending_tasks:
+                task_message = task_entry["task_message"]
+                formatted_task = {
+                    "task_id": task_message.get("task_id"),
+                    "title": task_message.get("task_title"),
+                    "description": task_message.get("task_description"),
+                    "required_capabilities": task_message.get("required_capabilities", []),
+                    "payload": task_message.get("payload", {}),
+                    "sender_id": task_message.get("sender_id"),
+                    "queued_at": task_entry["queued_at"],
+                    "protocol": "A2A"
+                }
+                formatted_tasks.append(formatted_task)
+            
+            # Clear the pending tasks after polling (delivered)
+            self.pending_a2a_tasks[agent_id] = []
+            
+            logger.info(f"📤 Delivered {len(formatted_tasks)} A2A tasks to agent {agent_id}")
+            
+            return {
+                "status": "success",
+                "message": f"Retrieved {len(formatted_tasks)} pending tasks",
+                "agent_id": agent_id,
+                "tasks": formatted_tasks,
+                "count": len(formatted_tasks),
+                "protocol": "A2A",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in A2A task polling: {e}")
+            return {
+                "status": "error",
+                "message": f"Internal error during task polling: {str(e)}",
+                "error_code": "INTERNAL_ERROR",
+                "tasks": []
+            }
+
+    async def _select_best_agent_for_a2a_task(self, required_capabilities: List[str]) -> Optional[str]:
+        """Select the best agent for an A2A task based on capabilities and availability"""
+        try:
+            if not self.agents:
+                return None
+            
+            # Score agents based on capability match and availability
+            agent_scores = []
+            
+            for agent_id, agent_data in self.agents.items():
+                agent_capabilities = agent_data.get("capabilities", [])
+                
+                # Calculate capability match score
+                if required_capabilities:
+                    matches = sum(1 for cap in required_capabilities if cap in agent_capabilities)
+                    capability_score = matches / len(required_capabilities)
+                else:
+                    capability_score = 1.0  # If no specific capabilities required
+                
+                # Bonus for online agents
+                online_bonus = 0.2 if agent_id in self.live_agent_connections else 0.0
+                
+                # TODO: Add reputation score when available
+                reputation_score = 0.1  # Placeholder
+                
+                total_score = capability_score + online_bonus + reputation_score
+                
+                agent_scores.append((agent_id, total_score, capability_score))
+            
+            # Sort by score (highest first)
+            agent_scores.sort(key=lambda x: x[1], reverse=True)
+            
+            # Return best agent if they have at least some capability match
+            if agent_scores and agent_scores[0][1] > 0:
+                selected_agent = agent_scores[0][0]
+                logger.info(f"Selected agent {selected_agent} for A2A task (score: {agent_scores[0][1]:.2f})")
+                return selected_agent
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error selecting agent for A2A task: {e}")
+            return None

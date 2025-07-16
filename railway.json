@@ -1,11 +1,25 @@
 {
   "build": {
-    "builder": "nixpacks"
+    "builder": "nixpacks",
+    "buildCommand": "pip install -r requirements.txt"
   },
   "deploy": {
-    "startCommand": "python src/main.py",
+    "startCommand": "python -m src.main_with_a2a_bridge",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 300,
-    "restartPolicyType": "ON_FAILURE"
+    "restartPolicyType": "on_failure"
+  },
+  "environments": {
+    "production": {
+      "variables": {
+        "PORT": "8080",
+        "LOBBY_HTTP_PORT": "8080", 
+        "LOBBY_WS_PORT": "8081",
+        "ENV": "production",
+        "LOG_LEVEL": "INFO",
+        "CORS_ORIGINS": "*",
+        "MAX_WORKERS": "4"
+      }
+    }
   }
 } 

@@ -1,0 +1,13 @@
+{
+  "postgresql": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "agent_lobby",
+    "username": "agent_lobby_user",
+    "password": "change_me_in_production",
+    "pool_size": 10,
+    "max_overflow": 20,
+    "pool_timeout": 30,
+    "ssl_mode": "prefer"
+  }
+}

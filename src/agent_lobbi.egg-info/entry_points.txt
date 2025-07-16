@@ -1,0 +1,4 @@
+[console_scripts]
+agent-lobbi = src.main:main
+agent-lobbi-metrics = src.core.agent_metrics_enhanced:main
+agent-lobbi-server = src.core.lobby:main

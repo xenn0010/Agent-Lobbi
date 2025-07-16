@@ -15,8 +15,15 @@ from pathlib import Path
 import asyncio
 import threading
 import time
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+# Optional watchdog import for file monitoring
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    WATCHDOG_AVAILABLE = True
+except ImportError:
+    Observer = None
+    FileSystemEventHandler = None
+    WATCHDOG_AVAILABLE = False
 
 # Environment and secrets
 from dotenv import load_dotenv
@@ -260,17 +267,24 @@ class AgentEcosystemConfig(BaseModel):
         self.features[feature_name] = enabled
 
 
-class ConfigFileHandler(FileSystemEventHandler):
-    """File system event handler for configuration hot reloading"""
-    
-    def __init__(self, config_manager):
-        self.config_manager = config_manager
-        self.logger = logging.getLogger(__name__)
-    
-    def on_modified(self, event):
-        if not event.is_directory and event.src_path in self.config_manager.watched_files:
-            self.logger.info(f"Configuration file changed: {event.src_path}")
-            asyncio.create_task(self.config_manager.reload_config())
+# Only define ConfigFileHandler if watchdog is available
+if WATCHDOG_AVAILABLE:
+    class ConfigFileHandler(FileSystemEventHandler):
+        """File system event handler for configuration hot reloading"""
+        
+        def __init__(self, config_manager):
+            self.config_manager = config_manager
+            self.logger = logging.getLogger(__name__)
+        
+        def on_modified(self, event):
+            if not event.is_directory and event.src_path in self.config_manager.watched_files:
+                self.logger.info(f"Configuration file changed: {event.src_path}")
+                asyncio.create_task(self.config_manager.reload_config())
+else:
+    # Dummy handler when watchdog is not available
+    class ConfigFileHandler:
+        def __init__(self, config_manager):
+            pass
 
 
 class ConfigManager:
@@ -300,9 +314,11 @@ class ConfigManager:
         # Load initial configuration
         self.load_config()
         
-        # Start file watching if enabled
-        if enable_hot_reload:
+        # Start file watching if enabled and available
+        if enable_hot_reload and WATCHDOG_AVAILABLE:
             self.start_watching()
+        elif enable_hot_reload and not WATCHDOG_AVAILABLE:
+            self.logger.warning("Hot reload requested but watchdog not available")
     
     def _init_encryption(self):
         """Initialize encryption for sensitive configuration values"""
@@ -511,7 +527,7 @@ class ConfigManager:
     
     def start_watching(self):
         """Start watching configuration files for changes"""
-        if not self.enable_hot_reload or not self.watched_files:
+        if not self.enable_hot_reload or not self.watched_files or not WATCHDOG_AVAILABLE:
             return
         
         try:

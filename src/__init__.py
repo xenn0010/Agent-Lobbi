@@ -25,7 +25,7 @@ from .security.data_protection_layer import DataProtectionLayer
 from .recovery.connection_recovery import ConnectionRecoverySystem
 from .tracking.agent_tracking_system import AgentTrackingSystem
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __author__ = "Agent Lobbi Team"
 __description__ = "The best engineered protocol-based multi-agent collaboration platform"
 

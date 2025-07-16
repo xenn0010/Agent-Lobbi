@@ -1,0 +1,183 @@
+Metadata-Version: 2.4
+Name: agent-lobbi
+Version: 1.0.1
+Summary: Enhanced A2A+ Agent Collaboration Platform with Advanced Metrics and Neuromorphic Intelligence
+Home-page: https://github.com/agentlobby/agent-lobbi
+Download-URL: https://github.com/agentlobby/agent-lobbi/archive/v1.0.1.tar.gz
+Author: Agent Lobby Team
+Author-email: Agent Lobby Team <support@agentlobby.com>
+Maintainer: Agent Lobby Team
+Maintainer-email: Agent Lobby Team <maintainers@agentlobby.com>
+License: MIT
+Project-URL: Homepage, https://agentlobby.com
+Project-URL: Documentation, https://docs.agentlobby.com
+Project-URL: Repository, https://github.com/agentlobby/agent-lobbi
+Project-URL: Bug Tracker, https://github.com/agentlobby/agent-lobbi/issues
+Project-URL: Changelog, https://github.com/agentlobby/agent-lobbi/blob/main/CHANGELOG.md
+Project-URL: Discord, https://discord.gg/agentlobby
+Project-URL: Twitter, https://twitter.com/agentlobby
+Keywords: agent,collaboration,a2a,artificial intelligence,multi-agent systems,distributed computing,neuromorphic,metrics,analytics,websocket,asyncio,real-time,business intelligence
+Platform: any
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Information Technology
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Classifier: Topic :: Internet :: WWW/HTTP :: HTTP Servers
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: System :: Distributed Computing
+Classifier: Topic :: System :: Networking
+Classifier: Framework :: AsyncIO
+Classifier: Environment :: Web Environment
+Classifier: Typing :: Typed
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: aiohttp>=3.8.0
+Requires-Dist: asyncio-mqtt>=0.13.0
+Requires-Dist: websockets>=11.0.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: fastapi>=0.100.0
+Requires-Dist: uvicorn>=0.23.0
+Requires-Dist: sqlalchemy>=2.0.0
+Requires-Dist: alembic>=1.11.0
+Requires-Dist: structlog>=23.0.0
+Requires-Dist: click>=8.0.0
+Requires-Dist: python-multipart>=0.0.6
+Requires-Dist: jinja2>=3.1.0
+Requires-Dist: cryptography>=41.0.0
+Requires-Dist: python-jose[cryptography]>=3.3.0
+Requires-Dist: bcrypt>=4.0.0
+Requires-Dist: httpx>=0.24.0
+Requires-Dist: rich>=13.0.0
+Requires-Dist: typer>=0.9.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
+Requires-Dist: black>=22.0.0; extra == "dev"
+Requires-Dist: flake8>=4.0.0; extra == "dev"
+Requires-Dist: mypy>=0.991; extra == "dev"
+Requires-Dist: pre-commit>=2.20.0; extra == "dev"
+Requires-Dist: isort>=5.12.0; extra == "dev"
+Requires-Dist: bandit>=1.7.0; extra == "dev"
+Provides-Extra: docs
+Requires-Dist: sphinx>=5.0.0; extra == "docs"
+Requires-Dist: sphinx-rtd-theme>=1.0.0; extra == "docs"
+Requires-Dist: myst-parser>=0.18.0; extra == "docs"
+Requires-Dist: sphinx-autodoc-typehints>=1.19.0; extra == "docs"
+Provides-Extra: monitoring
+Requires-Dist: prometheus-client>=0.15.0; extra == "monitoring"
+Requires-Dist: grafana-client>=3.0.0; extra == "monitoring"
+Requires-Dist: statsd>=4.0.0; extra == "monitoring"
+Provides-Extra: enterprise
+Requires-Dist: redis>=4.0.0; extra == "enterprise"
+Requires-Dist: celery>=5.0.0; extra == "enterprise"
+Requires-Dist: kubernetes>=24.0.0; extra == "enterprise"
+Requires-Dist: psycopg2-binary>=2.9.0; extra == "enterprise"
+Provides-Extra: all
+Requires-Dist: agent-lobbi[dev,docs,enterprise,monitoring]; extra == "all"
+Dynamic: author
+Dynamic: download-url
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: maintainer
+Dynamic: platform
+Dynamic: requires-python
+
+# 🤖 Agent Lobbi – Universal Agent Interoperability Platform
+
+[![PyPI version](https://badge.fury.io/py/agent-lobbi.svg)](https://badge.fury.io/py/agent-lobbi)
+[![Python Support](https://img.shields.io/pypi/pyversions/agent-lobbi.svg)](https://pypi.org/project/agent-lobbi/)
+[![License: Commercial](https://img.shields.io/badge/License-Commercial-red.svg)](https://agentlobby.com/license)
+
+**Agent Lobbi** is the all-in-one interoperability layer that lets *any* AI agent, service, or application collaborate seamlessly.  At its core is **A2A+** – our superset of the industry-standard A2A protocol – plus an advanced multi-agent orchestration engine, neuromorphic intelligence, real-time metrics, and enterprise-grade security.
+
+---
+
+## 🚀 Highlights
+
+| Capability | Why It Matters |
+|------------|----------------|
+| **Universal Interoperability** | Connect Python, JavaScript, REST, gRPC, and cloud functions out-of-the-box. |
+| **A2A+ Agent-to-Agent** | Speak fluent A2A while enjoying Lobbi extensions: streaming, auth, capability discovery. |
+| **Multi-Agent Orchestration** | Neuromorphic selection, N-to-N collaboration, automatic task decomposition. |
+| **Metrics & Observability** | 10 000+ metrics / sec, Prometheus endpoint, Grafana dashboard template included. |
+| **Enterprise Security** | Consensus, reputation, encryption, zero-trust by default. |
+| **Plug-and-Play SDKs** | Python & JS SDKs, CLI tooling, and ready-to-deploy Docker images. |
+
+---
+
+## 🧩 Installation
+
+```bash
+pip install agent-lobbi  # base
+# or
+pip install agent-lobbi[all]  # dev, docs, monitoring, enterprise extras
+```
+
+---
+
+## ⚡ Quick Start – 3 Lines
+
+```python
+from agent_lobbi import AgentLobbySDK
+sdk = AgentLobbySDK(enable_a2a=True)  # A2A+ on by default
+await sdk.register_agent(agent_id="hello_world", capabilities=["greeting"], auto_start_a2a=True)
+```
+Your agent immediately publishes an A2A+ card at `/.well-known/agent.json` and can accept or delegate tasks.
+
+---
+
+## 🤝 Multi-Agent Example (Async / Python)
+
+```python
+import asyncio
+from agent_lobbi import AgentLobbySDK
+
+async def main():
+    sdk = AgentLobbySDK(enable_a2a=True, enable_metrics=True)
+
+    # Register two simple agents
+    await sdk.register_agent("writer", capabilities=["draft"], auto_start_a2a=True)
+    await sdk.register_agent("reviewer", capabilities=["edit"], auto_start_a2a=True)
+
+    # Orchestrate a collaboration
+    report = await sdk.create_collaboration(
+        participants=["writer", "reviewer"],
+        purpose="Generate & polish Q3 report",
+        shared_workspace=True,
+    )
+    print("Collaboration ID:", report["collaboration_id"])
+
+asyncio.run(main())
+```
+
+---
+
+## 📊 Metrics in One Call
+
+```python
+metrics = sdk.get_metrics_dashboard()
+print(metrics["performance"]["response_time_ms"], "ms")
+```
+A Prometheus-ready endpoint is automatically exposed at `/api/metrics`.
+
+---
+
+## 🔐 License
+
+This software is provided under a **Commercial License**.  Contact <sales@agentlobby.com> for details and enterprise terms.
+
+---
+
+## ❤️ A Note From Us
+
+*Made with ❤️ from Agent Lobbi to you — happy collaborating!* 

@@ -1,33 +1,46 @@
-# Core dependencies
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-websockets==12.0
-asyncio==3.4.3
+# Core FastAPI and server dependencies
+fastapi==0.116.0
+uvicorn[standard]==0.35.0
+pydantic==2.11.7
+python-dotenv==1.1.1
+structlog==25.4.0
 
-# Database
-asyncpg==0.29.0
-sqlalchemy==2.0.23
-alembic==1.12.1
-psycopg2-binary==2.9.9
+# Database dependencies
+asyncpg==0.30.0
+sqlalchemy==2.0.41
+alembic==1.16.3
+psycopg2-binary==2.9.10
 
-# Data validation
-pydantic==2.5.0
-pydantic-settings==2.1.0
-
-# Authentication & Security
-python-jose[cryptography]==3.3.0
+# Authentication and security
+cryptography==45.0.5
+PyJWT==2.10.1
+python_bcrypt==0.3.2
 passlib[bcrypt]==1.7.4
-cryptography==41.0.7
-bcrypt==4.1.2
+
+# HTTP and networking
+aiohttp==3.12.9
+httpx==0.28.1
+websockets==15.0.1
+requests==2.32.4
+
+# Redis and caching
+redis==6.2.0
+aioredis==2.0.1
+
+# Data processing
+numpy==2.3.1
+pandas==2.3.1
+scipy==1.16.0
+PyYAML==6.0.2
+
+# Monitoring and metrics
+prometheus_client==0.22.1
+psutil==7.0.0
 
 # Utilities
-structlog==23.2.0
-aiofiles==23.2.1
-prometheus-client==0.19.0
-python-dotenv==1.0.0
+click==8.2.1
+tenacity==9.1.2
+watchdog==6.0.0
 
-# HTTP client
-aiohttp==3.9.1
-
-# Redis (optional for caching)
-redis==5.0.1 
+# Testing (optional for production)
+pytest==8.4.0 
