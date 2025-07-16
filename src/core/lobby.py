@@ -208,7 +208,13 @@ class Lobby:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         logger.info("OK Lobby stopped.")
-        
+
+    async def shutdown(self):
+        """Gracefully shuts down the lobby and all its components. For Railway."""
+        logger.info("Initiating Lobby shutdown sequence for Railway deployment...")
+        await self.stop()
+        logger.info("Lobby has been shut down successfully.")
+
     async def handle_http_request(self, reader, writer):
         """Handles HTTP requests for the lobby API."""
         try:
